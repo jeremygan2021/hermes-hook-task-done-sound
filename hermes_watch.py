@@ -140,7 +140,7 @@ def _push_gui_state(state: str, info: str) -> None:
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         s.settimeout(0.2)
-        s.sendto(payload, GUI_SOCKET)
+        s.sendto(payload, str(GUI_SOCKET))
         s.close()
     except OSError:
         pass                                              # GUI not running — silently skip

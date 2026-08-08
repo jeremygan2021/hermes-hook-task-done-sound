@@ -61,8 +61,8 @@ LIGHT_GAP = 5
 SPACING = LIGHT_R * 2 + LIGHT_GAP
 LIGHTS_TOP = BADGE_Y + BADGE_R + 12        # y of first light center
 PANEL_RADIUS = 14            # rounded-rect corner radius
+CHASE_PERIOD_MS = 420        # one full chaser cycle (OpenCode-style marquee)
 BOUNCE_AMPL = 6
-BOUNCE_PERIOD_MS = 760
 
 # Status light colors
 STATUS_COLORS = {
@@ -326,7 +326,7 @@ class LightPanel(Gtk.DrawingArea):
         ctx.stroke()
 
         now = time.time()
-        bounce = -math.cos((now * 1000 / BOUNCE_PERIOD_MS) * 2 * math.pi) * BOUNCE_AMPL
+        chase_phase = (now * 1000 / CHASE_PERIOD_MS) % 1.0
         blink = 0.45 + 0.55 * (0.5 + 0.5 * math.cos(now * 2 * math.pi))
 
         for i, s in enumerate(sess):
@@ -336,18 +336,24 @@ class LightPanel(Gtk.DrawingArea):
             _badge(ctx, cx, BADGE_Y, s.agent)
 
             # lights
-            layout = {
-                "busy":       [("blue", 0), ("dim", 1), ("dim", 2)],
-                "needs_perm": [("dim", 0), ("yellow", 1), ("dim", 2)],
-                "success":    [("dim", 0), ("dim", 1), ("green", 2)],
-                "failure":    [("red", 0), ("dim", 1), ("dim", 2)],
-                "idle":       [("dim", 0), ("dim", 1), ("dim", 2)],
-            }.get(s.state, [("dim", 0), ("dim", 1), ("dim", 2)])
+            if s.state == "busy":
+                # OpenCode-style chaser: lights 0→1→2→1→0, blue.
+                # Triangle wave over 3 positions, period = CHASE_PERIOD_MS.
+                tri = 2.0 - abs(2.0 - (chase_phase * 4.0) % 4.0)   # 0..2..0
+                cur = min(2, max(0, int(round(tri))))
+                layout = [("dim", 0), ("dim", 1), ("dim", 2)]
+                layout[cur] = ("blue", cur)
+            elif s.state == "needs_perm":
+                layout = [("dim", 0), ("yellow", 1), ("dim", 2)]
+            elif s.state == "success":
+                layout = [("dim", 0), ("dim", 1), ("green", 2)]
+            elif s.state == "failure":
+                layout = [("red", 0), ("dim", 1), ("dim", 2)]
+            else:
+                layout = [("dim", 0), ("dim", 1), ("dim", 2)]
 
             for color, idx in layout:
                 cy = LIGHTS_TOP + idx * SPACING
-                if s.state == "busy" and idx == 0:
-                    cy += bounce
                 rgb = STATUS_COLORS[color]
                 alpha = 1.0
                 if color == "dim":
