@@ -73,12 +73,37 @@ STATUS_COLORS = {
     "dim":    (0.16, 0.16, 0.19),
 }
 
-# Agent identity — badge color + icon painter
+# Agent identity — brand color + SVG logo
+LOGO_DIR = os.path.expanduser("~/.local/share/hermes-light/logos")
+
 AGENTS = {
-    "hermes":   {"color": (0.55, 0.40, 0.95),  "label": "H"},   # purple
-    "claude":   {"color": (0.95, 0.62, 0.34),  "label": "C"},   # amber
-    "opencode": {"color": (0.20, 0.80, 0.70),  "label": "O"},   # teal
+    "hermes":   {"color": (0.55, 0.40, 0.95),  "svg": "hermes.svg"},
+    "claude":   {"color": (0.95, 0.62, 0.34),  "svg": "claude.svg"},
+    "opencode": {"color": (0.20, 0.80, 0.70),  "svg": "opencode.svg"},
 }
+
+_rsvg_cache: dict[str, cairo.Surface] = {}
+
+
+def _load_logo_surface(agent: str) -> cairo.Surface | None:
+    """Render the agent's SVG logo to a cairo ImageSurface (cached)."""
+    if agent in _rsvg_cache:
+        return _rsvg_cache[agent]
+    path = os.path.join(LOGO_DIR, AGENTS[agent]["svg"])
+    if not os.path.exists(path):
+        return None
+    try:
+        gi.require_version("Rsvg", "2.0")
+        from gi.repository import Rsvg  # noqa: F811
+        handle = Rsvg.Handle.new_from_file(path)
+        dim = handle.get_dimensions()
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, dim.width, dim.height)
+        ctx = cairo.Context(surf)
+        handle.render_cairo(ctx)
+        _rsvg_cache[agent] = surf
+        return surf
+    except Exception:
+        return None
 
 
 # ──── session registry ───────────────────────────────────────────
@@ -231,9 +256,8 @@ def _light(ctx: cairo.Context, cx: float, cy: float, rgb, alpha: float, radius: 
 
 
 def _badge(ctx: cairo.Context, cx: float, cy: float, agent: str):
-    """Agent identity badge: colored disc + letter mark."""
+    """Agent identity badge: brand-color glow + official SVG logo."""
     rgb = AGENTS[agent]["color"]
-    label = AGENTS[agent]["label"]
     # outer glow
     ctx.set_source_rgba(*rgb, 0.35)
     ctx.arc(cx, cy, BADGE_R + 5, 0, 2 * math.pi)
@@ -247,13 +271,29 @@ def _badge(ctx: cairo.Context, cx: float, cy: float, agent: str):
     ctx.set_source(grad)
     ctx.arc(cx, cy, BADGE_R, 0, 2 * math.pi)
     ctx.fill()
-    # letter
-    ctx.set_source_rgba(1, 1, 1, 0.95)
-    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-    ctx.set_font_size(BADGE_R * 1.15)
-    xb, yb, w, h, _dx, _dy = ctx.text_extents(label)
-    ctx.move_to(cx - w / 2 - xb, cy - h / 2 - yb)
-    ctx.show_text(label)
+
+    # official logo on top, scaled into the disc
+    surf = _load_logo_surface(agent)
+    if surf is not None:
+        sw, sh = surf.get_width(), surf.get_height()
+        if sw > 0 and sh > 0:
+            scale = (BADGE_R * 1.5) / max(sw, sh)
+            ctx.save()
+            ctx.translate(cx, cy)
+            ctx.scale(scale, scale)
+            ctx.translate(-sw / 2, -sh / 2)
+            ctx.set_source_surface(surf, 0, 0)
+            ctx.paint()
+            ctx.restore()
+    else:
+        # fallback: letter
+        label = agent[0].upper()
+        ctx.set_source_rgba(1, 1, 1, 0.95)
+        ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(BADGE_R * 1.15)
+        xb, yb, w, h, _dx, _dy = ctx.text_extents(label)
+        ctx.move_to(cx - w / 2 - xb, cy - h / 2 - yb)
+        ctx.show_text(label)
 
 
 # ──── drawing area ───────────────────────────────────────────────

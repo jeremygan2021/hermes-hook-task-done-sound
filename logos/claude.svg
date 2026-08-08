@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <!-- Anthropic brand mark: an 8-point starburst (asterisk) with rounded rays -->
+  <g transform="translate(50 50)">
+    <!-- outer rays -->
+    <path d="M0 -38 L4.5 -11 L11 -11 L6.5 -38 Z" fill="#d97757"/>
+    <path d="M0 38 L4.5 11 L11 11 L6.5 38 Z" fill="#d97757"/>
+    <path d="M-38 0 L-11 4.5 L-11 11 L-38 6.5 Z" fill="#d97757"/>
+    <path d="M38 0 L11 4.5 L11 11 L38 6.5 Z" fill="#d97757"/>
+    <!-- diagonal rays (rotate the same shape 45deg) -->
+    <g transform="rotate(45)">
+      <path d="M0 -38 L4.5 -11 L11 -11 L6.5 -38 Z" fill="#d97757"/>
+      <path d="M0 38 L4.5 11 L11 11 L6.5 38 Z" fill="#d97757"/>
+      <path d="M-38 0 L-11 4.5 L-11 11 L-38 6.5 Z" fill="#d97757"/>
+      <path d="M38 0 L11 4.5 L11 11 L38 6.5 Z" fill="#d97757"/>
+    </g>
+    <!-- center circle -->
+    <circle cx="0" cy="0" r="9" fill="#d97757"/>
+  </g>
+</svg>
