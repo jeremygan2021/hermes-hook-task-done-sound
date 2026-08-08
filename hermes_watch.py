@@ -25,8 +25,11 @@ parent is a shell (i.e. an interactive CLI session), excluding the daemon itself
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -97,10 +100,50 @@ def _play(sound_name: str) -> None:
 
 def _alert(kind: str, pty: str) -> None:
     _log(f"→ {kind:7s}  {pty}")
+    # Map CPU-watcher's "start"/"success" onto the GUI's state vocabulary.
+    gui_state = {"start": "busy", "success": "success"}.get(kind)
+    if gui_state is not None:
+        _push_gui_state(gui_state, pty)
     if kind == "start":
         _play("start.wav")
     elif kind == "success":
         _play("success.wav")
+
+
+# ──────────────────────── GUI integration ──────────────────────
+
+GUI_SOCKET = Path.home() / ".hermes" / "run" / "hermes-light.sock"
+
+
+def _push_gui_state(state: str, info: str) -> None:
+    """Best-effort push of a state update to the hermes-light GUI.
+
+    `info` looks like "pts/0 (pid 54990, 100.3% CPU)" — extract the pid.
+    The GUI keys its columns by `<pts>:<pid>` so we must match that format.
+    """
+    if not GUI_SOCKET.exists():
+        return
+    # Pull the (pid NNNN) group out of the info string.
+    m = re.search(r"pid\s+(\d+)", info)
+    if not m:
+        return
+    pid = m.group(1)
+    pts_m = re.match(r"(pts/\S+)", info)
+    pty = pts_m.group(1) if pts_m else "?"
+    session_key = f"{pty}:{pid}"
+    payload = json.dumps({
+        "session": session_key,
+        "pty": pty,
+        "state": state,
+        "ts": time.time(),
+    }).encode()
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.settimeout(0.2)
+        s.sendto(payload, GUI_SOCKET)
+        s.close()
+    except OSError:
+        pass                                              # GUI not running — silently skip
 
 
 # ──────────────────────── logging ──────────────────────────────
@@ -282,6 +325,8 @@ def run(stop_event: threading.Event) -> None:
                     _log(f"  + watching pid {pid} ({st.pty})")
             # evaluate each
             now = time.time()
+            debug = os.getenv("HERMES_WATCH_DEBUG")
+            for pid, st in tracked.items():
                 cpu = group_cpu(st)
                 observed = "busy" if cpu >= BUSY_THRESHOLD else (
                           "idle" if cpu <= IDLE_THRESHOLD else "mid")
