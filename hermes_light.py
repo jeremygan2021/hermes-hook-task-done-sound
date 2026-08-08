@@ -1,39 +1,32 @@
 """
-hermes-light — always-on-top GTK window showing one RGBY light column per
-running Hermes CLI session.  Each column reflects that session's state in
-real time.
+hermes-light — always-on-top GTK widget showing one status column per running
+AI coding agent session (Hermes / Claude Code / OpenCode).
 
-Layout:
-  [col_0] [col_1] [col_2] ...   horizontally, left-to-right
-  Each column is 76x130, with three stacked circles:
-      top    red   (failure / blink)
-      middle yellow (needs permission)
-      bottom green (success)
+Each column:
+  - an agent badge (distinct icon + brand color) at the top
+  - three stacked status lights (red / yellow / green) below
 
-Communication: the GUI listens on a Unix datagram socket at
-~/.hermes/run/hermes-light.sock.  Two message shapes:
+State → lights:
+  busy       → BLUE light, vertical bounce
+  needs_perm → YELLOW solid
+  success    → GREEN solid (click / 'a' acks → idle)
+  failure    → RED blink
+  idle       → all dim
 
-  Hook → GUI (state update):
-    {"session": "pts/0", "pid": 54990, "state": "busy"}
-    {"session": "pts/0", "pid": 54990, "state": "needs_perm"}
-    {"session": "pts/0", "pid": 54990, "state": "success"}
-    {"session": "pts/0", "pid": 54990, "state": "failure"}
-    {"session": "pts/0", "pid": 54990, "state": "idle"}
+Agent detection: scans `ps` for comm names `hermes`, `claude`, `opencode`
+(plus node/bun argv0 fallbacks) and builds one column per session.
 
-  GUI → Hook (ack after success):
-    {"ack": true, "session": "pts/0"}
+Communication: Unix datagram socket at ~/.hermes/run/hermes-light.sock.
+  Hook/watch → GUI:  {"session": "pts/0:54990", "state": "busy"}
+  GUI → hook/watch:  {"ack": true, "session": "pts/0:54990"}
 
-When no hook is pushing state, columns are auto-discovered from
-running `hermes` processes (mirroring hermes-watch) — state defaults
-to idle and lights up only when a hook message arrives.
-
-Clicking or pressing 'a' on a green column sends the ack and turns it
-idle.  Dragging the window anywhere moves it.
+Drag the window anywhere with the left button; click (no drag) on a green
+column to ack; 'a' acks the first success column.
 
 Run:
-  hermes-light                # foreground, Ctrl-C to stop
-  hermes-light --bg           # fork into background
-  hermes-light --stop         # stop the bg instance
+  hermes-light             # foreground, Ctrl-C to stop
+  hermes-light --bg        # background (pidfile-guarded)
+  hermes-light --stop      # stop the background instance
 """
 from __future__ import annotations
 
@@ -57,41 +50,46 @@ SOCKET_PATH = os.path.expanduser("~/.hermes/run/hermes-light.sock")
 PIDFILE = os.path.expanduser("~/.hermes/run/hermes-light.pid")
 LOGFILE = os.path.expanduser("~/.hermes/logs/hermes-light.log")
 
-# ──── visual ──────────────────────────────────────────────────────
-COL_W = 56
-COL_H = 130
-COL_GAP = 6
-CIRCLE_R = 11
-SPACING = CIRCLE_R * 2 + 4
+# ──── visual constants ───────────────────────────────────────────
+COL_W = 64
+COL_H = 148
+COL_GAP = 8
+BADGE_R = 15                 # agent badge circle radius
+BADGE_Y = 20                 # badge center y
+LIGHT_R = 11                 # status light radius
+LIGHT_GAP = 5
+SPACING = LIGHT_R * 2 + LIGHT_GAP
+LIGHTS_TOP = BADGE_Y + BADGE_R + 12        # y of first light center
+PANEL_RADIUS = 14            # rounded-rect corner radius
 BOUNCE_AMPL = 6
-BOUNCE_PERIOD_MS = 700
+BOUNCE_PERIOD_MS = 760
 
-COLORS = {
-    "blue":   (0.30, 0.62, 1.00),
-    "yellow": (1.00, 0.83, 0.20),
-    "green":  (0.36, 0.84, 0.46),
-    "red":    (1.00, 0.36, 0.36),
-    "dim":    (0.18, 0.18, 0.20),
+# Status light colors
+STATUS_COLORS = {
+    "blue":   (0.28, 0.60, 1.00),
+    "yellow": (1.00, 0.82, 0.18),
+    "green":  (0.34, 0.85, 0.46),
+    "red":    (1.00, 0.34, 0.36),
+    "dim":    (0.16, 0.16, 0.19),
 }
 
-STATE_TO_COLOR = {
-    "busy":       "blue",
-    "needs_perm": "yellow",
-    "success":    "green",
-    "failure":    "red",
-    "idle":       "dim",
+# Agent identity — badge color + icon painter
+AGENTS = {
+    "hermes":   {"color": (0.55, 0.40, 0.95),  "label": "H"},   # purple
+    "claude":   {"color": (0.95, 0.62, 0.34),  "label": "C"},   # amber
+    "opencode": {"color": (0.20, 0.80, 0.70),  "label": "O"},   # teal
 }
 
 
-# ──── session state ──────────────────────────────────────────────
+# ──── session registry ───────────────────────────────────────────
 class Session:
-    __slots__ = ("key", "label", "state", "ack_pending")
+    __slots__ = ("key", "label", "agent", "state")
 
-    def __init__(self, key: str, label: str):
-        self.key = key            # stable id (e.g. "pts/0:54990" or just "pts/0")
-        self.label = label        # short text under the column
+    def __init__(self, key: str, label: str, agent: str = "hermes"):
+        self.key = key
+        self.label = label
+        self.agent = agent if agent in AGENTS else "hermes"
         self.state = "idle"
-        self.ack_pending = False  # True when success is showing, awaiting user ack
 
 
 sessions_lock = threading.Lock()
@@ -99,20 +97,20 @@ sessions: dict[str, Session] = {}
 sessions_order: list[str] = []
 
 
-def add_or_update_session(key: str, label: str | None = None) -> Session:
+def add_or_update(key: str, label: str, agent: str = "hermes") -> None:
     with sessions_lock:
         s = sessions.get(key)
         if s is None:
-            s = Session(key, label or key)
-            sessions[key] = s
+            sessions[key] = Session(key, label, agent)
             sessions_order.append(key)
-        elif label:
+        else:
             s.label = label
-        return s
+            if agent in AGENTS:
+                s.agent = agent
 
 
-def set_session_state(key: str, state: str) -> bool:
-    if state not in STATE_TO_COLOR:
+def set_state(key: str, state: str) -> bool:
+    if state not in ("busy", "needs_perm", "success", "failure", "idle"):
         return False
     with sessions_lock:
         s = sessions.get(key)
@@ -121,104 +119,206 @@ def set_session_state(key: str, state: str) -> bool:
             sessions[key] = s
             sessions_order.append(key)
         s.state = state
-        s.ack_pending = (state == "success")
         return True
 
 
+def drop_if_missing(alive: set[str]) -> None:
+    with sessions_lock:
+        for k in list(sessions_order):
+            if k not in alive:
+                sessions.pop(k, None)
+                sessions_order.remove(k)
+
+
+def snapshot() -> list[Session]:
+    with sessions_lock:
+        return [sessions[k] for k in sessions_order]
+
+
+# ──── agent discovery ────────────────────────────────────────────
+def detect_agent(pid: int, comm: str) -> str:
+    """Map a process to an agent type.  Checks comm first, then argv0."""
+    c = comm.lower()
+    if c == "hermes":
+        return "hermes"
+    if c in ("claude", "claude-code", "claude-code-cli"):
+        return "claude"
+    if c in ("opencode", "opencode-cli"):
+        return "opencode"
+    # node / bun shims: peek at argv0
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return ""
+    argv0 = args[0].split("/")[-1].lower() if args else ""
+    joined = " ".join(args).lower()
+    if "claude" in argv0 or "/claude" in joined:
+        return "claude"
+    if "opencode" in argv0 or "opencode" in joined:
+        return "opencode"
+    return ""
+
+
+def discover_sessions() -> list[tuple[str, str, str]]:
+    """Return [(key, label, agent)] for running agent CLI processes.
+
+    Keys match what the watcher/hook pushes: "<tty>:<pid>".
+    """
+    try:
+        out = subprocess.check_output(["ps", "-eo", "pid=,comm="], text=True)
+    except subprocess.CalledProcessError:
+        return []
+    found: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        pid_s, comm = parts
+        agent = detect_agent(int(pid_s), comm)
+        if not agent:
+            continue
+        # Resolve the tty (ps tty column) for a stable label
+        try:
+            tty_out = subprocess.check_output(
+                ["ps", "-p", pid_s, "-o", "tty="], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            tty_out = "?"
+        if tty_out == "?":
+            key = f"{agent}:{pid_s}"
+            label = f"{agent} {pid_s}"
+        else:
+            key = f"{tty_out}:{pid_s}"
+            label = tty_out
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append((key, label, agent))
+    return found
+
+
+# ──── drawing helpers ────────────────────────────────────────────
+def _rounded_rect(ctx: cairo.Context, x: float, y: float, w: float, h: float, r: float):
+    ctx.move_to(x + r, y)
+    ctx.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    ctx.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    ctx.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    ctx.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+    ctx.close_path()
+
+
+def _light(ctx: cairo.Context, cx: float, cy: float, rgb, alpha: float, radius: float):
+    """A status light: soft outer glow + radial-gradient core + specular."""
+    # glow
+    ctx.set_source_rgba(*rgb, alpha * 0.28)
+    ctx.arc(cx, cy, radius + 5, 0, 2 * math.pi)
+    ctx.fill()
+    # core (radial gradient)
+    grad = cairo.RadialGradient(cx - radius * 0.35, cy - radius * 0.35, radius * 0.2,
+                                cx, cy, radius)
+    grad.add_color_stop_rgba(0, min(1, rgb[0] + 0.25), min(1, rgb[1] + 0.25),
+                             min(1, rgb[2] + 0.25), alpha)
+    grad.add_color_stop_rgba(1, rgb[0], rgb[1], rgb[2], alpha)
+    ctx.set_source(grad)
+    ctx.arc(cx, cy, radius, 0, 2 * math.pi)
+    ctx.fill()
+    # specular dot
+    ctx.set_source_rgba(1, 1, 1, alpha * 0.5)
+    ctx.arc(cx - radius * 0.3, cy - radius * 0.35, radius * 0.28, 0, 2 * math.pi)
+    ctx.fill()
+
+
+def _badge(ctx: cairo.Context, cx: float, cy: float, agent: str):
+    """Agent identity badge: colored disc + letter mark."""
+    rgb = AGENTS[agent]["color"]
+    label = AGENTS[agent]["label"]
+    # outer glow
+    ctx.set_source_rgba(*rgb, 0.35)
+    ctx.arc(cx, cy, BADGE_R + 5, 0, 2 * math.pi)
+    ctx.fill()
+    # disc with radial gradient
+    grad = cairo.RadialGradient(cx - BADGE_R * 0.3, cy - BADGE_R * 0.3, BADGE_R * 0.15,
+                                cx, cy, BADGE_R)
+    grad.add_color_stop_rgba(0, min(1, rgb[0] + 0.3), min(1, rgb[1] + 0.3),
+                             min(1, rgb[2] + 0.3), 1.0)
+    grad.add_color_stop_rgba(1, rgb[0], rgb[1], rgb[2], 1.0)
+    ctx.set_source(grad)
+    ctx.arc(cx, cy, BADGE_R, 0, 2 * math.pi)
+    ctx.fill()
+    # letter
+    ctx.set_source_rgba(1, 1, 1, 0.95)
+    ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+    ctx.set_font_size(BADGE_R * 1.15)
+    xb, yb, w, h, _dx, _dy = ctx.text_extents(label)
+    ctx.move_to(cx - w / 2 - xb, cy - h / 2 - yb)
+    ctx.show_text(label)
+
+
 # ──── drawing area ───────────────────────────────────────────────
-class LightGrid(Gtk.DrawingArea):
+class LightPanel(Gtk.DrawingArea):
     def __init__(self):
         super().__init__()
         self.set_size_request(COL_W, COL_H)
         self.connect("draw", self._on_draw)
 
     def _on_draw(self, widget, ctx: cairo.Context):
-        with sessions_lock:
-            order = list(sessions_order)
-            snap = {k: sessions[k].state for k in order}
+        sess = snapshot()
+        if not sess:
+            return False
 
+        n = len(sess)
+        w = n * COL_W + (n - 1) * COL_GAP
+        h = COL_H
+
+        # translucent rounded panel
         ctx.set_operator(cairo.OPERATOR_SOURCE)
         ctx.set_source_rgba(0, 0, 0, 0)
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
+        _rounded_rect(ctx, 0, 0, w, h, PANEL_RADIUS)
+        ctx.set_source_rgba(0.05, 0.05, 0.08, 0.72)
+        ctx.fill()
+        ctx.set_line_width(1.0)
+        ctx.set_source_rgba(1, 1, 1, 0.08)
+        _rounded_rect(ctx, 0.5, 0.5, w - 1, h - 1, PANEL_RADIUS)
+        ctx.stroke()
 
         now = time.time()
         bounce = -math.cos((now * 1000 / BOUNCE_PERIOD_MS) * 2 * math.pi) * BOUNCE_AMPL
-        blink = 0.4 + 0.6 * (0.5 + 0.5 * math.cos(now * 2 * math.pi))
+        blink = 0.45 + 0.55 * (0.5 + 0.5 * math.cos(now * 2 * math.pi))
 
-        for i, key in enumerate(order):
-            st = snap[key]
-            cx = COL_W / 2
-            first_cy = (COL_H - (3 * SPACING - 4)) / 2
+        for i, s in enumerate(sess):
+            cx = COL_W / 2 + i * (COL_W + COL_GAP)
 
-            if st == "busy":
-                positions = [("busy", "blue"), ("dim", "dim"), ("dim", "dim")]
-            elif st == "failure":
-                positions = [("failure", "red"), ("dim", "dim"), ("dim", "dim")]
-            elif st == "needs_perm":
-                positions = [("dim", "dim"), ("needs_perm", "yellow"), ("dim", "dim")]
-            elif st == "success":
-                positions = [("dim", "dim"), ("dim", "dim"), ("success", "green")]
-            else:
-                positions = [("dim", "dim"), ("dim", "dim"), ("dim", "dim")]
+            # badge
+            _badge(ctx, cx, BADGE_Y, s.agent)
 
-            offset_x = i * (COL_W + COL_GAP)
-            for j, (_state_name, color_name) in enumerate(positions):
-                cy = first_cy + j * SPACING
-                if j == 0 and st == "busy":
+            # lights
+            layout = {
+                "busy":       [("blue", 0), ("dim", 1), ("dim", 2)],
+                "needs_perm": [("dim", 0), ("yellow", 1), ("dim", 2)],
+                "success":    [("dim", 0), ("dim", 1), ("green", 2)],
+                "failure":    [("red", 0), ("dim", 1), ("dim", 2)],
+                "idle":       [("dim", 0), ("dim", 1), ("dim", 2)],
+            }.get(s.state, [("dim", 0), ("dim", 1), ("dim", 2)])
+
+            for color, idx in layout:
+                cy = LIGHTS_TOP + idx * SPACING
+                if s.state == "busy" and idx == 0:
                     cy += bounce
-                rgb = COLORS.get(color_name, COLORS["dim"])
+                rgb = STATUS_COLORS[color]
                 alpha = 1.0
-                if color_name == "dim":
-                    alpha = 0.5
-                elif st == "failure" and color_name == "red":
+                if color == "dim":
+                    alpha = 0.55
+                elif s.state == "failure" and color == "red":
                     alpha = blink
-                ctx.set_source_rgba(*rgb, alpha * 0.30)
-                ctx.arc(offset_x + cx, cy, CIRCLE_R + 3, 0, 2 * math.pi); ctx.fill()
-                ctx.set_source_rgba(*rgb, alpha)
-                ctx.arc(offset_x + cx, cy, CIRCLE_R, 0, 2 * math.pi); ctx.fill()
-                ctx.set_source_rgba(1, 1, 1, alpha * 0.45)
-                ctx.arc(offset_x + cx - CIRCLE_R * 0.3, cy - CIRCLE_R * 0.3,
-                        CIRCLE_R * 0.35, 0, 2 * math.pi); ctx.fill()
+                _light(ctx, cx, cy, rgb, alpha, LIGHT_R)
         return False
 
 
-# ──── discovery ───────────────────────────────────────────────────
-def discover_hermes_sessions() -> list[tuple[str, str]]:
-    """Return [(key, label)] for every running `hermes` CLI process.
-
-    Auto-adds them as idle sessions so the GUI shows one column per session
-    even before the hook pushes any state.
-    """
-    try:
-        out = subprocess.check_output(
-            ["ps", "-eo", "pid=,comm=,tty="], text=True
-        )
-    except subprocess.CalledProcessError:
-        return []
-    found: list[tuple[str, str]] = []
-    seen: set[str] = set()
-    for line in out.splitlines():
-        parts = line.strip().split(None, 2)
-        if len(parts) < 3 or parts[1] != "hermes":
-            continue
-        pid, _comm, tty = parts
-        # ps already prefixes the tty column with "pts/" (e.g. "pts/0").  If
-        # it's "?" the process has no controlling terminal.
-        if tty == "?":
-            key = f"pid:{pid}"
-            label = f"pid {pid}"
-        else:
-            key = f"{tty}:{pid}"            # "pts/0:54990"
-            label = tty                     # "pts/0"
-        if key in seen:
-            continue
-        seen.add(key)
-        found.append((key, label))
-    return found
-
-
-# ──── window ──────────────────────────────────────────────────────
+# ──── window with drag ───────────────────────────────────────────
 class LightWindow(Gtk.Window):
     def __init__(self):
         super().__init__()
@@ -235,11 +335,10 @@ class LightWindow(Gtk.Window):
         if visual:
             self.set_visual(visual)
 
-        self.grid = LightGrid()
-        self.add(self.grid)
-        self.grid.show()
+        self.panel = LightPanel()
+        self.add(self.panel)
+        self.panel.show()
 
-        # Drag state — set by button-press, consumed by motion-notify.
         self._drag_start_xy: tuple[int, int] | None = None
         self._drag_start_win_xy: tuple[int, int] | None = None
         self._drag_active = False
@@ -248,26 +347,20 @@ class LightWindow(Gtk.Window):
                         | Gdk.EventMask.BUTTON_MOTION_MASK
                         | Gdk.EventMask.BUTTON_RELEASE_MASK
                         | Gdk.EventMask.KEY_PRESS_MASK)
-
         self.connect("button-press-event", self._on_btn_press)
         self.connect("motion-notify-event", self._on_motion)
         self.connect("button-release-event", self._on_btn_release)
         self.connect("key-press-event", self._on_key)
 
     def _on_btn_press(self, widget, event):
-        # Left button → start drag (and possibly ack on click-without-drag)
         if event.button == 1:
             self._drag_start_xy = (event.x_root, event.y_root)
             x, y = self.get_position()
             self._drag_start_win_xy = (x, y)
             self._drag_active = False
-            # Grab pointer so motion events are routed to us even if the
-            # cursor leaves the window mid-drag — otherwise the WM steals
-            # the gesture and we never see the motion events.
             Gtk.grab_add(self)
             return True
         if event.button == 3:
-            # Right-click: ack whichever column was clicked
             self._ack_at(event.x)
             return True
         return False
@@ -299,7 +392,12 @@ class LightWindow(Gtk.Window):
 
     def _on_key(self, widget, event):
         if event.keyval == Gdk.KEY_a:
-            self._ack_first_success()
+            with sessions_lock:
+                for k in sessions_order:
+                    if sessions[k].state == "success":
+                        sessions[k].state = "idle"
+                        _send_ack(k)
+                        break
             return True
         return False
 
@@ -309,9 +407,7 @@ class LightWindow(Gtk.Window):
         if not order:
             return None
         idx = int(x // (COL_W + COL_GAP))
-        if 0 <= idx < len(order):
-            return order[idx]
-        return None
+        return order[idx] if 0 <= idx < len(order) else None
 
     def _ack_at(self, x: float):
         key = self._column_at(x)
@@ -322,17 +418,7 @@ class LightWindow(Gtk.Window):
             if s is None or s.state != "success":
                 return
             s.state = "idle"
-            s.ack_pending = False
         _send_ack(key)
-
-    def _ack_first_success(self):
-        with sessions_lock:
-            for k in sessions_order:
-                if sessions[k].state == "success":
-                    sessions[k].state = "idle"
-                    sessions[k].ack_pending = False
-                    _send_ack(k)
-                    return
 
 
 def _send_ack(key: str):
@@ -350,26 +436,22 @@ def _send_ack(key: str):
 def refresh_window_size(win: LightWindow):
     with sessions_lock:
         n = len(sessions_order)
-    if n == 0:
-        n = 1
+    n = max(1, n)
     w = n * COL_W + (n - 1) * COL_GAP
-    # set_default_size + queue_resize are needed because plain .resize() is
-    # ignored on a decorated=False / set_resizable(False) window.
     win.set_default_size(w, COL_H)
     win.resize(w, COL_H)
     win.queue_resize()
-    # Tell the DrawingArea the new size too — its on_draw uses (COL_W, COL_H)
-    # per column, but its widget-level size_request is still (COL_W, COL_H).
-    if hasattr(win, "grid"):
-        win.grid.set_size_request(w, COL_H)
+    win.panel.set_size_request(w, COL_H)
 
 
 # ──── socket server ──────────────────────────────────────────────
 def socket_server(write_log):
     os.makedirs(os.path.dirname(SOCKET_PATH), exist_ok=True)
     if os.path.exists(SOCKET_PATH):
-        try: os.unlink(SOCKET_PATH)
-        except OSError: pass
+        try:
+            os.unlink(SOCKET_PATH)
+        except OSError:
+            pass
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     srv.bind(SOCKET_PATH)
     os.chmod(SOCKET_PATH, 0o660)
@@ -386,54 +468,61 @@ def socket_server(write_log):
                 write_log(f"bad json: {data!r}")
                 continue
             key = msg.get("session") or msg.get("pty") or "default"
-            label = msg.get("pty") or key
             if msg.get("ack"):
                 write_log(f"ack from {key}")
                 continue
             state = msg.get("state") or msg.get("kind")
-            if state in STATE_TO_COLOR:
-                GLib.idle_add(set_session_state, key, state)
-                GLib.idle_add(add_or_update_session, key, label)
+            if state in ("busy", "needs_perm", "success", "failure", "idle"):
+                GLib.idle_add(set_state, key, state)
                 write_log(f"recv: {key} → {state}")
 
     threading.Thread(target=_serve, daemon=True).start()
     return srv
 
 
-# ──── background mode ────────────────────────────────────────────
+# ──── daemon helpers ─────────────────────────────────────────────
 def daemonize():
     if os.path.exists(PIDFILE):
         try:
             old = int(open(PIDFILE).read().strip())
             os.kill(old, 0)
-            print(f"already running pid={old}", file=sys.stderr); sys.exit(1)
+            print(f"already running pid={old}", file=sys.stderr)
+            sys.exit(1)
         except (OSError, ValueError):
             pass
     os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
     rfd = os.open(LOGFILE, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
-    os.dup2(rfd, 1); os.dup2(rfd, 2)
-    if os.fork() > 0: sys.exit(0)
+    os.dup2(rfd, 1)
+    os.dup2(rfd, 2)
+    if os.fork() > 0:
+        sys.exit(0)
     os.setsid()
-    if os.fork() > 0: sys.exit(0)
+    if os.fork() > 0:
+        sys.exit(0)
     open(PIDFILE, "w").write(str(os.getpid()))
 
 
 def stop_daemon():
     if not os.path.exists(PIDFILE):
-        print("not running"); return
+        print("not running")
+        return
     pid = int(open(PIDFILE).read().strip())
-    try: os.kill(pid, signal.SIGTERM); print(f"sent SIGTERM to {pid}")
-    except OSError as e: print(f"failed: {e}")
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"sent SIGTERM to {pid}")
+    except OSError as e:
+        print(f"failed: {e}")
 
 
-# ──── log ────────────────────────────────────────────────────────
 def _log(msg: str):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line, file=sys.stderr, flush=True)
     try:
         os.makedirs(os.path.dirname(LOGFILE), exist_ok=True)
-        with open(LOGFILE, "a") as f: f.write(line + "\n")
-    except OSError: pass
+        with open(LOGFILE, "a") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
 
 
 # ──── main ───────────────────────────────────────────────────────
@@ -442,44 +531,37 @@ def main():
     ap.add_argument("--bg", action="store_true")
     ap.add_argument("--stop", action="store_true")
     args = ap.parse_args()
-    if args.stop: stop_daemon(); return
-    if args.bg: daemonize()
+    if args.stop:
+        stop_daemon()
+        return
+    if args.bg:
+        daemonize()
 
     win = LightWindow()
 
     display = Gdk.Display.get_default()
     mon = display.get_primary_monitor() or display.get_monitor(0)
     geom = mon.get_geometry()
-    win.move(geom.x + geom.width - 200, geom.y + 48)
+    win.move(geom.x + geom.width - 220, geom.y + 40)
 
-    # Seed with currently-running hermes sessions.
-    discovered = discover_hermes_sessions()
-    _log(f"discover initial: {discovered}")
-    for key, label in discovered:
-        add_or_update_session(key, label)
+    for key, label, agent in discover_sessions():
+        add_or_update(key, label, agent)
     refresh_window_size(win)
-    _log(f"sessions after seed: {list(sessions_order)}")
     win.show_all()
 
-    # Animation tick — redraws so bouncing + blinking stay smooth.
     def tick():
-        win.grid.queue_draw()
+        win.panel.queue_draw()
         return True
     GLib.timeout_add(33, tick)
 
-    # Periodically rediscover hermes sessions (new ones appear, old ones exit).
     def rediscover():
-        discovered = discover_hermes_sessions()
-        for key, label in discovered:
-            add_or_update_session(key, label)
-        alive = {k for k, _ in discovered}
-        with sessions_lock:
-            for k in list(sessions_order):
-                if k not in alive:
-                    sessions.pop(k, None)
-                    sessions_order.remove(k)
+        discovered = discover_sessions()
+        alive = {k for k, _l, _a in discovered}
+        for key, label, agent in discovered:
+            add_or_update(key, label, agent)
+        drop_if_missing(alive)
         refresh_window_size(win)
-        _log(f"rediscover: {list(sessions_order)}")
+        _log(f"discover: {[(s.key, s.agent, s.state) for s in snapshot()]}")
         return True
     GLib.timeout_add_seconds(3, rediscover)
 
