@@ -160,6 +160,59 @@ def snapshot() -> list[Session]:
         return [sessions[k] for k in sessions_order]
 
 
+# ──── session-name resolution ────────────────────────────────────
+_SESSION_DB = os.path.expanduser("~/.hermes/state.db")
+
+
+def _proc_start_epoch(pid: int) -> float:
+    """Process start time as epoch, from /proc (no locale-dependent ps)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            s = f.read()
+        rp = s.rfind(")")
+        start_ticks = int(s[rp + 1:].split()[19])
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime"):
+                    boot = int(line.split()[1])
+                    break
+        return boot + start_ticks / 100.0
+    except Exception:
+        return 0.0
+
+
+def session_label_for_pid(pid: int) -> str | None:
+    """Map a hermes PID to its session's display name or short start time."""
+    try:
+        import sqlite3
+        pep = _proc_start_epoch(pid)
+        if pep <= 0:
+            return None
+        conn = sqlite3.connect(f"file:{_SESSION_DB}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT id, display_name, started_at, ended_at FROM sessions "
+            "WHERE source='cli' ORDER BY started_at DESC LIMIT 30"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return None
+    active = [r for r in rows if r[3] is None]
+    if not active:
+        return None
+    best = min(active, key=lambda r: abs(r[2] - pep))
+    sid, name, _ts, _ended = best
+    # Brand-new session not yet written? Fall back to process start time.
+    if abs(_ts - pep) > 300 and pep > _ts:
+        return time.strftime("%H:%M", time.localtime(pep))
+    if name:
+        return name
+    try:
+        time_part = sid.split("_")[1]
+        return f"{time_part[:2]}:{time_part[2:4]}"
+    except (IndexError, ValueError):
+        return sid[:12]
+
+
 # ──── agent discovery ────────────────────────────────────────────
 def detect_agent(pid: int, comm: str) -> str:
     """Map a process to an agent type.  Checks comm first, then argv0."""
@@ -201,7 +254,8 @@ def discover_sessions() -> list[tuple[str, str, str]]:
         if len(parts) < 2:
             continue
         pid_s, comm = parts
-        agent = detect_agent(int(pid_s), comm)
+        pid_i = int(pid_s)
+        agent = detect_agent(pid_i, comm)
         if not agent:
             continue
         # Resolve the tty (ps tty column) for a stable label
@@ -211,12 +265,18 @@ def discover_sessions() -> list[tuple[str, str, str]]:
             ).strip()
         except subprocess.CalledProcessError:
             tty_out = "?"
-        if tty_out == "?":
-            key = f"{agent}:{pid_s}"
+        # Prefer the session name/start-time when we can resolve it.
+        sess_label = session_label_for_pid(pid_i)
+        if sess_label:
+            label = sess_label
+        elif tty_out == "?":
             label = f"{agent} {pid_s}"
         else:
-            key = f"{tty_out}:{pid_s}"
             label = tty_out
+        if tty_out == "?":
+            key = f"{agent}:{pid_s}"
+        else:
+            key = f"{tty_out}:{pid_s}"
         if key in seen:
             continue
         seen.add(key)
@@ -331,6 +391,16 @@ class LightPanel(Gtk.DrawingArea):
 
         for i, s in enumerate(sess):
             cx = COL_W / 2 + i * (COL_W + COL_GAP)
+
+            # session name below the badge, above the lights (small, dim)
+            if s.label:
+                ctx.set_source_rgba(1, 1, 1, 0.85)
+                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                                     cairo.FONT_WEIGHT_BOLD)
+                ctx.set_font_size(10)
+                xb, yb, tw, th, _dx, _dy = ctx.text_extents(s.label)
+                ctx.move_to(cx - tw / 2 - xb, BADGE_Y + BADGE_R + 10 - yb)
+                ctx.show_text(s.label)
 
             # badge
             _badge(ctx, cx, BADGE_Y, s.agent)
