@@ -1,0 +1,5 @@
+name: task-done-sound
+description: Play a short audio cue when an agent task starts / finishes (success only)
+events:
+  - agent:start
+  - agent:end

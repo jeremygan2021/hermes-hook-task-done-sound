@@ -1,0 +1,7 @@
+{
+  "mode": "sound",
+  "volume": 0.6,
+  "player": "auto",
+  "failure_sound": null,
+  "delay_seconds": 3
+}
