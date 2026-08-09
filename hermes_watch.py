@@ -3,21 +3,29 @@
 hermes-watch — daemon that watches running `hermes` CLI processes and plays
 audio cues when each one transitions between idle and busy.
 
-Detection strategy (no hook framework, no gateway, no code changes to Hermes):
-  - Sample the process group CPU% (hermes PID + all its MCP/subagent children)
-  - "idle":  group CPU% < IDLE_THRESHOLD for IDLE_SECS consecutive samples
-  - "busy":  group CPU% >= BUSY_THRESHOLD for BUSY_SECS consecutive samples
+Detection strategy (priority order):
+  1. **Sentinel files** (100% accurate — written by the hermes wrapper):
+     - /tmp/hermes-status-<pid>  exists  →  agent is busy
+     - /tmp/hermes-done-<pid>    appears →  agent just finished (success beat)
+  2. **CPU sampling** (fallback for hermes launches that bypass the wrapper):
+     - busy:  group CPU% >= BUSY_THRESHOLD for BUSY_SECS consecutive samples
+     - idle:  group CPU% <  IDLE_THRESHOLD for IDLE_SECS consecutive samples
+     - CPU is unreliable: hermes CLI spends ~99% of wall clock waiting on the
+       LLM stream, so a "busy" agent often shows 0% CPU. Sentinels fix this.
+
+Audio + GUI channel is shared so a single event produces exactly one
+audio+light update (no more "light says green but no sound" mismatch).
 
 Audio:
-  - idle (becomes idle after being busy)  →  success.wav (the "loss" descending tone)
-  - busy (becomes busy after being idle)  →  start.wav (滴滴滴滴)
+  - busy  →  start.wav  (滴滴滴滴)
+  - done  →  success.wav (the "loss" descending tone)
   - failure: not detected here (no semantic access to agent output).
-            Use the gateway hook for that.
 
 Run:
   hermes-watch               # foreground, Ctrl-C to stop
-  hermes-watch --daemon       # background, log to ~/.hermes/logs/hermes-watch.log
-  hermes-watch --stop         # stop the daemon
+  hermes-watch --daemon      # deprecated — use the systemd user service
+  hermes-watch --install    # install + start the systemd user service
+  hermes-watch --stop        # stop the running daemon
 
 Auto-discovery: scans `ps` for any process whose comm is `hermes` AND whose
 parent is a shell (i.e. an interactive CLI session), excluding the daemon itself.
@@ -25,6 +33,7 @@ parent is a shell (i.e. an interactive CLI session), excluding the daemon itself
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import re
@@ -40,11 +49,12 @@ from pathlib import Path
 SOUNDS_DIR = Path("/home/kali/.local/share/hermes-task-sound")
 PIDFILE = Path.home() / ".hermes" / "run" / "hermes-watch.pid"
 LOGFILE = Path.home() / ".hermes" / "logs" / "hermes-watch.log"
+STATUS_DIR = Path("/tmp")
 
 # Tunables (overridable via CLI flags)
-IDLE_THRESHOLD = 5.0     # group CPU% below this counts as idle
-BUSY_THRESHOLD = 20.0    # group CPU% above this counts as busy
-IDLE_SECS = 2.5          # must stay idle this long → fire "success" cue
+IDLE_THRESHOLD = 2.0     # group CPU% below this counts as idle
+BUSY_THRESHOLD = 8.0     # group CPU% above this counts as busy (hermes thinking often 5-15%)
+IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue
 BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue
 POLL_INTERVAL = 0.25     # sampling cadence
 SAMPLE_WINDOW = 1.0      # ps sample window in seconds (cumulative)
@@ -61,6 +71,7 @@ class ProcState:
     children: dict[int, float] = field(default_factory=dict)  # pid → last cpu sample
     parent_cpu: float = 0.0
     children_cpu: float = 0.0
+    io_prev: int = 0                     # last total rchar bytes (IO activity)
     last_alert_at: float = 0.0           # for rate-limiting audio per process
 
 
@@ -98,16 +109,70 @@ def _play(sound_name: str) -> None:
         _log(f"playback failed: {e}")
 
 
-def _alert(kind: str, pty: str) -> None:
-    _log(f"→ {kind:7s}  {pty}")
-    # Map CPU-watcher's "start"/"success" onto the GUI's state vocabulary.
-    gui_state = {"start": "busy", "success": "success"}.get(kind)
-    if gui_state is not None:
-        _push_gui_state(gui_state, pty)
+def _alert(kind: str, pty: str, pid: int | None = None) -> None:
+    """Single channel for both audio + GUI updates. Guarantees they stay in sync.
+
+    `kind` is "start" (busy → fire 滴滴), "done" (success → fire 当当) or
+    "needs_perm" (yellow — awaiting user approval).
+    `pid` is required so the GUI column can be keyed by pts:N:pid.
+    """
+    _log(f"→ {kind:7s}  {pty} (pid={pid})")
+    # Map watcher events onto the GUI's state vocabulary.
+    gui_state = {"start": "busy", "done": "success", "needs_perm": "needs_perm"}.get(kind)
+    if gui_state is not None and pid is not None:
+        _push_gui_state(gui_state, pty, pid)
+
+    settings = _load_settings()
+    sound_on = settings.get("sound_enabled", True)
+    tts_on = settings.get("tts_enabled", True)
+
     if kind == "start":
-        _play("start.wav")
-    elif kind == "success":
-        _play("success.wav")
+        if sound_on:
+            _play("start.wav")
+    elif kind in ("done", "needs_perm"):
+        # TTS report takes priority when enabled; else the classic cue
+        tts_path = None
+        if tts_on and pid is not None:
+            try:
+                comm = _comm_of(pid)
+            except Exception:
+                comm = "hermes"
+            agent = detect_agent(pid, comm)
+            tts_path = _tts_report_for(agent, kind)
+        if tts_path:
+            _play_wav_path(tts_path, settings.get("tts_volume", 0.7))
+        elif sound_on:
+            _play("success.wav")
+
+
+def _comm_of(pid: int) -> str:
+    """Read a process comm name quickly."""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return "hermes"
+
+
+def _play_wav_path(path: str, volume: float) -> None:
+    """Play an arbitrary wav at a given volume (fire-and-forget)."""
+    player = _pick_player()
+    if player is None:
+        return
+    try:
+        if player == "paplay":
+            cmd = ["paplay", f"--volume={int(volume * 65535)}", path]
+        elif player == "aplay":
+            cmd = ["aplay", "-q", path]
+        elif player == "mpv":
+            cmd = ["mpv", "--no-terminal", "--really-quiet",
+                   f"--volume={int(volume * 100)}", path]
+        else:
+            cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+                   "-volume", str(int(volume * 100)), path]
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:                  # noqa: BLE001
+        _log(f"tts playback failed: {e}")
 
 
 # ──────────────────────── GUI integration ──────────────────────
@@ -115,25 +180,22 @@ def _alert(kind: str, pty: str) -> None:
 GUI_SOCKET = Path.home() / ".hermes" / "run" / "hermes-light.sock"
 
 
-def _push_gui_state(state: str, info: str) -> None:
+def _push_gui_state(state: str, pty: str, pid: int) -> None:
     """Best-effort push of a state update to the hermes-light GUI.
 
-    `info` looks like "pts/0 (pid 54990, 100.3% CPU)" — extract the pid.
     The GUI keys its columns by `<pts>:<pid>` so we must match that format.
     """
     if not GUI_SOCKET.exists():
         return
-    # Pull the (pid NNNN) group out of the info string.
-    m = re.search(r"pid\s+(\d+)", info)
-    if not m:
-        return
-    pid = m.group(1)
-    pts_m = re.match(r"(pts/\S+)", info)
-    pty = pts_m.group(1) if pts_m else "?"
-    session_key = f"{pty}:{pid}"
+    # Normalize pty: GUI rounds "?" to "(no-tty)" — keep the same convention.
+    if pty == "?":
+        pts_key = "(no-tty)"
+    else:
+        pts_key = pty
+    session_key = f"{pts_key}:{pid}"
     payload = json.dumps({
         "session": session_key,
-        "pty": pty,
+        "pty": pts_key,
         "state": state,
         "ts": time.time(),
     }).encode()
@@ -299,6 +361,142 @@ def group_cpu(state: ProcState) -> float:
     return p_cpu + c_cpu
 
 
+def _consume_done_tombstones() -> dict[int, str]:
+    """Atomically consume /tmp/hermes-done-* files (rename to .acked).
+
+    The wrapper writes these on hermes exit — they are the most reliable
+    "agent finished" signal and beat CPU-based detection by 100% accuracy.
+
+    Renaming (instead of unlink) prevents the same beat from being re-fired
+    if two daemon iterations race — only the one that wins the rename gets it.
+    """
+    consumed: dict[int, str] = {}
+    pattern = str(STATUS_DIR / "hermes-done-*")
+    for path_str in glob.glob(pattern):
+        path = Path(path_str)
+        if path.suffix == ".acked":
+            continue
+        try:
+            content = path.read_text()
+        except OSError:
+            continue
+        m_pid = re.search(r"pid=(\d+)", content)
+        m_tty = re.search(r"tty=(\S+)", content)
+        if not m_pid:
+            continue
+        try:
+            pid = int(m_pid.group(1))
+        except ValueError:
+            continue
+        tty = m_tty.group(1) if m_tty else "?"
+        try:
+            path.rename(path.with_suffix(".acked"))
+        except OSError:
+            continue
+        consumed[pid] = tty
+    return consumed
+
+
+def _sentinel_busy(pid: int) -> bool:
+    """True if /tmp/hermes-status-<pid> exists (wrapper wrote it on startup)."""
+    return (STATUS_DIR / f"hermes-status-{pid}").exists()
+
+
+# ──────────────────────── shared settings ──────────────────────
+SETTINGS_PATH = Path.home() / ".hermes" / "hermes-light-settings.json"
+TTS_WAV_DIR = Path.home() / ".local" / "share" / "hermes-light" / "tts" / "wav"
+
+_tts_cache: dict = {}
+
+
+def _load_settings() -> dict:
+    """Cache settings for up to 3s (GUI writes them; we re-read occasionally)."""
+    global _tts_cache
+    try:
+        mtime = SETTINGS_PATH.stat().st_mtime
+        if _tts_cache.get("mtime") == mtime:
+            return _tts_cache
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        _tts_cache = {"mtime": mtime, **data}
+        return _tts_cache
+    except OSError:
+        return {}
+
+
+def detect_agent(pid: int, comm: str) -> str:
+    """Map a process to an agent type (hermes/claude/opencode)."""
+    c = comm.lower()
+    if c == "hermes":
+        return "hermes"
+    if c in ("claude", "claude-code", "claude-code-cli"):
+        return "claude"
+    if c in ("opencode", "opencode-cli"):
+        return "opencode"
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().decode("utf-8", "replace").split("\0")
+    except OSError:
+        return "hermes"
+    argv0 = args[0].split("/")[-1].lower() if args else ""
+    joined = " ".join(args).lower()
+    if "claude" in argv0 or "/claude" in joined:
+        return "claude"
+    if "opencode" in argv0 or "opencode" in joined:
+        return "opencode"
+    return "hermes"
+
+
+# TTS report wav keyed by agent/event
+TTS_REPORT_FILES = {
+    "task_done":    "task_done.wav",
+    "hermes_done":  "hermes_done.wav",
+    "claude_done":  "claude_done.wav",
+    "opencode_done": "opencode_done.wav",
+    "needs_perm":   "needs_perm.wav",
+}
+
+
+def _tts_report_for(agent: str, event: str) -> str | None:
+    """Pick the TTS wav for an agent+event. Returns absolute path or None."""
+    if event == "needs_perm":
+        key = "needs_perm"
+    elif event == "done":
+        key = f"{agent}_done" if agent in ("hermes", "claude", "opencode") else "task_done"
+    else:
+        return None
+    fname = TTS_REPORT_FILES.get(key)
+    if not fname:
+        return None
+    p = TTS_WAV_DIR / fname
+    return str(p) if p.is_file() else None
+
+
+def _sample_io_bytes(pid: int) -> int:
+    """Cumulative bytes read by pid (rchar from /proc/<pid>/io).
+
+    A hermes process waiting on the LLM stream shows ~0 CPU but its socket
+    read counter climbs every time a chunk arrives — this is the signal that
+    distinguishes "working" from "idle at the prompt".
+    """
+    try:
+        with open(f"/proc/{pid}/io") as f:
+            for line in f:
+                if line.startswith("rchar:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def group_io_delta(state: ProcState) -> int:
+    """Bytes read since last sample across parent + children."""
+    total = _sample_io_bytes(state.pid) + sum(_sample_io_bytes(c) for c in state.children)
+    delta = max(0, total - state.io_prev)
+    state.io_prev = total
+    return delta
+
+
 # ──────────────────────────── main loop ────────────────────────
 
 def run(stop_event: threading.Event) -> None:
@@ -310,6 +508,20 @@ def run(stop_event: threading.Event) -> None:
 
     while not stop_event.is_set():
         try:
+            # 1) Tombstone sweep (highest priority — 100% accurate done signal)
+            done_tombstones = _consume_done_tombstones()
+            for pid, tty in done_tombstones.items():
+                pty = tty if tty != "?" else "(no-tty)"
+                if pid in tracked:
+                    _alert("done", pty, pid)
+                else:
+                    _log(f"  ! tombstone for unknown pid {pid} ({pty})")
+                    _alert("done", pty, pid)
+                stale = STATUS_DIR / f"hermes-status-{pid}"
+                if stale.exists():
+                    stale.unlink()
+                tracked.pop(pid, None)
+
             current = discover_hermes_pids(self_pid)
             # remove stale
             for pid in list(tracked):
@@ -327,11 +539,27 @@ def run(stop_event: threading.Event) -> None:
             now = time.time()
             debug = os.getenv("HERMES_WATCH_DEBUG")
             for pid, st in tracked.items():
+                # 2) Sentinel-based busy (highest priority — instant & 100% accurate)
+                if _sentinel_busy(pid):
+                    if st.last_state != "busy":
+                        _log(f"  ▲ pid {pid} ({st.pty}) sentinel says BUSY")
+                        if st.last_state == "idle":
+                            _alert("start", st.pty, pid)
+                            st.last_alert_at = now
+                        st.last_state = "busy"
+                        st.since = now
+                    continue
+                # 3) CPU + IO fallback (no sentinel — wrapper not used for this PID)
                 cpu = group_cpu(st)
-                observed = "busy" if cpu >= BUSY_THRESHOLD else (
-                          "idle" if cpu <= IDLE_THRESHOLD else "mid")
+                io_delta = group_io_delta(st)
+                if cpu >= BUSY_THRESHOLD or io_delta > 0:
+                    observed = "busy"
+                elif cpu <= IDLE_THRESHOLD and io_delta == 0:
+                    observed = "idle"
+                else:
+                    observed = "mid"
                 if debug:
-                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% observed={observed} state={st.last_state}")
+                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B observed={observed} state={st.last_state} (fallback)")
                 # transitions
                 if st.last_state == "unknown":
                     if observed in ("idle", "busy"):
@@ -345,15 +573,14 @@ def run(stop_event: threading.Event) -> None:
                     continue
                 dur = now - st.since
                 if st.last_state == "busy" and observed == "idle" and dur >= IDLE_SECS:
-                    # rate-limit: don't alert more than once per 3s per process
                     if now - st.last_alert_at >= 3.0:
-                        _alert("success", f"{st.pty} (pid {pid}, {cpu:.1f}% CPU)")
+                        _alert("done", st.pty, pid)
                         st.last_alert_at = now
                     st.last_state = "idle"
                     st.since = now
                 elif st.last_state == "idle" and observed == "busy" and dur >= BUSY_SECS:
                     if now - st.last_alert_at >= 3.0:
-                        _alert("start", f"{st.pty} (pid {pid}, {cpu:.1f}% CPU)")
+                        _alert("start", st.pty, pid)
                         st.last_alert_at = now
                     st.last_state = "busy"
                     st.since = now

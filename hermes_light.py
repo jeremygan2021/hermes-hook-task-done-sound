@@ -49,20 +49,26 @@ from gi.repository import Gtk, Gdk, GLib  # noqa: E402
 SOCKET_PATH = os.path.expanduser("~/.hermes/run/hermes-light.sock")
 PIDFILE = os.path.expanduser("~/.hermes/run/hermes-light.pid")
 LOGFILE = os.path.expanduser("~/.hermes/logs/hermes-light.log")
+SETTINGS_PATH = os.path.expanduser("~/.hermes/hermes-light-settings.json")
+TTS_WAV_DIR = os.path.expanduser("~/.local/share/hermes-light/tts/wav")
 
 # ──── visual constants ───────────────────────────────────────────
-COL_W = 64
-COL_H = 148
-COL_GAP = 8
-BADGE_R = 15                 # agent badge circle radius
-BADGE_Y = 20                 # badge center y
-LIGHT_R = 11                 # status light radius
+COL_W = 82                  # column width (compact, modern)
+COL_H = 152                 # column height
+COL_GAP = 6
+BADGE_R = 19                 # badge radius
+BADGE_Y = 60                 # badge center y
+LIGHT_R = 5                  # small inline lights
 LIGHT_GAP = 5
-SPACING = LIGHT_R * 2 + LIGHT_GAP
-LIGHTS_TOP = BADGE_Y + BADGE_R + 12        # y of first light center
-PANEL_RADIUS = 14            # rounded-rect corner radius
-CHASE_PERIOD_MS = 420        # one full chaser cycle (OpenCode-style marquee)
+PANEL_RADIUS = 14            # rounded corners (per-column card)
+PANEL_PAD = 8                # inner padding
+CHASE_PERIOD_MS = 420        # one full chaser cycle
 BOUNCE_AMPL = 6
+
+# Inline 3-light positions at top of column
+LIGHTS_Y = 18                # y of all 3 lights
+LIGHTS_X_STEP = LIGHT_R * 2 + LIGHT_GAP  # step between lights
+GEAR_INSET = 18              # gear / indicator offset from panel right edge
 
 # Status light colors
 STATUS_COLORS = {
@@ -85,8 +91,28 @@ AGENTS = {
 _rsvg_cache: dict[str, cairo.Surface] = {}
 
 
+# Brand colors used to recolor `currentColor` SVG logos (hex, no white bg)
+LOGO_FILL = {
+    "hermes":   "#8b5cf6",   # violet — Hermes brand
+    "claude":   "#d97757",   # clay/orange — Claude brand
+    "opencode": "#2dd4bf",   # teal — OpenCode brand
+}
+
+_LOGO_FILL_CSS = {
+    agent: f"*{{fill:{color}!important;}}"
+    for agent, color in LOGO_FILL.items()
+}
+
+
 def _load_logo_surface(agent: str) -> cairo.Surface | None:
-    """Render the agent's SVG logo to a cairo ImageSurface (cached)."""
+    """Render the agent's SVG logo at 64x64 on TRANSPARENT background.
+
+    The SVGs use `fill="currentColor"` which librsvg renders as black by
+    default. We inject a CSS rule before parsing that forces every element
+    to the agent's brand color, so the logo renders in color with a
+    transparent background — no white disc needed. The badge provides the
+    brand-colored disc behind it.
+    """
     if agent in _rsvg_cache:
         return _rsvg_cache[agent]
     path = os.path.join(LOGO_DIR, AGENTS[agent]["svg"])
@@ -95,10 +121,20 @@ def _load_logo_surface(agent: str) -> cairo.Surface | None:
     try:
         gi.require_version("Rsvg", "2.0")
         from gi.repository import Rsvg  # noqa: F811
-        handle = Rsvg.Handle.new_from_file(path)
-        dim = handle.get_dimensions()
-        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, dim.width, dim.height)
+        raw = Path(path).read_text()
+        # Inject CSS forcing brand color; librsvg supports <style> in data.
+        css = _LOGO_FILL_CSS.get(agent, "")
+        svg_with_css = raw.replace(
+            "<svg",
+            f'<svg><style>{css}</style>',
+            1,
+        ) if css else raw
+        handle = Rsvg.Handle.new_from_data(svg_with_css.encode())
+        size = 64
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
         ctx = cairo.Context(surf)
+        # Transparent background — logo draws in its brand color
+        ctx.scale(size / 24.0, size / 24.0)
         handle.render_cairo(ctx)
         _rsvg_cache[agent] = surf
         return surf
@@ -107,31 +143,138 @@ def _load_logo_surface(agent: str) -> cairo.Surface | None:
 
 
 # ──── session registry ───────────────────────────────────────────
-class Session:
-    __slots__ = ("key", "label", "agent", "state")
+SUCCESS_AUTOFADE_SECS = 8.0         # auto-clear green light after this many seconds
 
-    def __init__(self, key: str, label: str, agent: str = "hermes"):
+
+# ──── settings (persisted to JSON, shared with hermes-watch) ───────
+DEFAULT_SETTINGS = {
+    "sound_enabled":   True,        # play the success/start wav at all
+    "tts_enabled":     True,        # also speak a Chinese report on done/needs_perm
+    "tts_voice":       "zh-CN-XiaoxiaoNeural",
+    "tts_volume":      0.7,         # 0.0–1.0, applied to paplay
+    "tts_player":      "paplay",    # player used for TTS (defaults to wav-compatible)
+}
+
+# Voices we expose in the dropdown (Chinese + a couple of English fallbacks)
+TTS_VOICES = [
+    "zh-CN-XiaoxiaoNeural",
+    "zh-CN-YunxiNeural",
+    "zh-CN-YunjianNeural",
+    "zh-CN-YunyangNeural",
+    "zh-CN-XiaoyiNeural",
+    "zh-CN-liaoning-XiaobeiNeural",
+    "zh-CN-shaanxi-XiaoniNeural",
+    "en-US-AriaNeural",
+    "en-US-GuyNeural",
+]
+
+# TTS report files: key → relative filename in TTS_WAV_DIR
+TTS_REPORTS = {
+    "task_done":    "task_done.wav",
+    "hermes_done":  "hermes_done.wav",
+    "claude_done":  "claude_done.wav",
+    "opencode_done": "opencode_done.wav",
+    "needs_perm":   "needs_perm.wav",
+}
+
+
+def _load_settings() -> dict:
+    """Load settings from disk; return DEFAULT_SETTINGS on any failure."""
+    try:
+        with open(SETTINGS_PATH) as f:
+            data = json.load(f)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update({k: v for k, v in data.items() if k in DEFAULT_SETTINGS})
+        return merged
+    except (OSError, ValueError, json.JSONDecodeError):
+        return dict(DEFAULT_SETTINGS)
+
+
+def _save_settings(s: dict) -> None:
+    """Persist settings to disk; best-effort."""
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_PATH), exist_ok=True)
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+    except OSError as e:
+        _log(f"settings save failed: {e}")
+
+
+settings_lock = threading.Lock()
+settings: dict = _load_settings()
+
+
+def get_settings() -> dict:
+    with settings_lock:
+        return dict(settings)
+
+
+def update_settings(**changes) -> dict:
+    """Update one or more settings, persist, and return the new dict."""
+    with settings_lock:
+        for k, v in changes.items():
+            if k in DEFAULT_SETTINGS:
+                settings[k] = v
+        _save_settings(settings)
+        return dict(settings)
+
+
+class Session:
+    __slots__ = ("key", "label", "agent", "state", "success_since", "model", "start_ts", "pid")
+
+    def __init__(self, key: str, label: str, agent: str = "hermes", pid: int = 0):
         self.key = key
         self.label = label
         self.agent = agent if agent in AGENTS else "hermes"
         self.state = "idle"
+        self.success_since: float = 0.0   # epoch time when state entered "success"
+        self.model: str = ""              # LLM model in use (from state.db)
+        self.start_ts: float = 0.0        # process start epoch (for uptime)
+        self.pid = pid                    # process id (0 = unknown)
 
 
 sessions_lock = threading.Lock()
 sessions: dict[str, Session] = {}
 sessions_order: list[str] = []
+_last_busy_push: dict[str, float] = {}   # key → last time watch pushed "busy"
 
 
-def add_or_update(key: str, label: str, agent: str = "hermes") -> None:
+def _sentinel_busy(pid: int) -> bool:
+    """True if /tmp/hermes-status-<pid> exists (wrapper wrote it on startup)."""
+    return os.path.exists(f"/tmp/hermes-status-{pid}")
+
+
+def add_or_update(key: str, label: str, agent: str = "hermes", pid: int = 0) -> None:
     with sessions_lock:
         s = sessions.get(key)
         if s is None:
-            sessions[key] = Session(key, label, agent)
+            s = Session(key, label, agent, pid)
+            sessions[key] = s
             sessions_order.append(key)
         else:
             s.label = label
             if agent in AGENTS:
                 s.agent = agent
+            if pid:
+                s.pid = pid
+        # Refresh model + uptime metadata from state.db / /proc
+        if pid:
+            s.model = model_for_pid(pid) or s.model
+            s.start_ts = _proc_start_epoch(pid) or s.start_ts
+        # Sentinel check: /tmp/hermes-status-<pid> exists → agent process alive.
+        # BUT a recent socket push (success/failure/needs_perm) wins — the
+        # agent process can stay alive while the current task finished.
+        if pid and _sentinel_busy(pid):
+            if time.time() - _last_busy_push.get(key, 0) > 12.0:
+                if s.state != "busy":
+                    s.state = "busy"
+                    s.success_since = 0.0
+        elif s.state == "busy":
+            # Sentinel gone AND no fresh socket push → fall back to idle.
+            if time.time() - _last_busy_push.get(key, 0) > 2.0:
+                s.state = "idle"
 
 
 def set_state(key: str, state: str) -> bool:
@@ -144,7 +287,31 @@ def set_state(key: str, state: str) -> bool:
             sessions[key] = s
             sessions_order.append(key)
         s.state = state
+        if state == "success":
+            s.success_since = time.time()
+        else:
+            s.success_since = 0.0
+        if state == "busy":
+            _last_busy_push[key] = time.time()
+        elif state in ("success", "failure", "needs_perm"):
+            _last_busy_push[key] = time.time()   # recent push → don't override w/ sentinel
         return True
+
+
+def autofade_success() -> None:
+    """Background tick: clear green light after SUCCESS_AUTOFADE_SECS of solitude.
+
+    If the agent restarts within the window (state moves to busy), the timer
+    resets. This is the safety net for the rare case where hermes-watch misses
+    a "done" beat — the green light still doesn't get stuck forever.
+    """
+    cutoff = time.time() - SUCCESS_AUTOFADE_SECS
+    with sessions_lock:
+        for s in sessions.values():
+            if s.state == "success" and s.success_since > 0 and s.success_since < cutoff:
+                _log(f"autofade: {s.key} success → idle ({SUCCESS_AUTOFADE_SECS}s elapsed)")
+                s.state = "idle"
+                s.success_since = 0.0
 
 
 def drop_if_missing(alive: set[str]) -> None:
@@ -211,6 +378,46 @@ def session_label_for_pid(pid: int) -> str | None:
         return f"{time_part[:2]}:{time_part[2:4]}"
     except (IndexError, ValueError):
         return sid[:12]
+
+
+def model_for_pid(pid: int) -> str | None:
+    """Look up the LLM model used by the given hermes session (from state.db).
+
+    state.db.sessions has a `model` column; match by process start time.
+    Tolerates up to 600s drift so a session that's a few minutes old still
+    resolves; also tries argv session-id matching as a fallback.
+    """
+    try:
+        import sqlite3
+        pep = _proc_start_epoch(pid)
+        if pep <= 0:
+            return None
+        conn = sqlite3.connect(f"file:{_SESSION_DB}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT id, model, started_at FROM sessions "
+            "WHERE source='cli' AND model IS NOT NULL AND model != '' "
+            "ORDER BY started_at DESC LIMIT 30"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    # 1) cmdline may carry the session id (hermes runs with session context)
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = f.read().decode("utf-8", "replace").split("\0")
+        joined = " ".join(args)
+        for sid, model, _ts in rows:
+            if sid in joined:
+                return model
+    except OSError:
+        pass
+    # 2) start-time matching with 600s tolerance
+    best = min(rows, key=lambda r: abs(r[2] - pep))
+    if abs(best[2] - pep) > 600:
+        return None
+    return best[1]
 
 
 # ──── agent discovery ────────────────────────────────────────────
@@ -280,7 +487,7 @@ def discover_sessions() -> list[tuple[str, str, str]]:
         if key in seen:
             continue
         seen.add(key)
-        found.append((key, label, agent))
+        found.append((key, label, agent, pid_i))
     return found
 
 
@@ -316,28 +523,37 @@ def _light(ctx: cairo.Context, cx: float, cy: float, rgb, alpha: float, radius: 
 
 
 def _badge(ctx: cairo.Context, cx: float, cy: float, agent: str):
-    """Agent identity badge: brand-color glow + official SVG logo."""
+    """Agent identity badge: brand-colored disc + colored SVG logo, no white bg."""
     rgb = AGENTS[agent]["color"]
-    # outer glow
-    ctx.set_source_rgba(*rgb, 0.35)
-    ctx.arc(cx, cy, BADGE_R + 5, 0, 2 * math.pi)
+    # outer glow (brand color, soft)
+    ctx.set_source_rgba(*rgb, 0.40)
+    ctx.arc(cx, cy, BADGE_R + 6, 0, 2 * math.pi)
     ctx.fill()
-    # disc with radial gradient
+
+    # disc with radial gradient in brand color (darker edge → lighter center)
     grad = cairo.RadialGradient(cx - BADGE_R * 0.3, cy - BADGE_R * 0.3, BADGE_R * 0.15,
                                 cx, cy, BADGE_R)
-    grad.add_color_stop_rgba(0, min(1, rgb[0] + 0.3), min(1, rgb[1] + 0.3),
-                             min(1, rgb[2] + 0.3), 1.0)
+    grad.add_color_stop_rgba(0, min(1, rgb[0] + 0.35), min(1, rgb[1] + 0.35),
+                             min(1, rgb[2] + 0.35), 1.0)
     grad.add_color_stop_rgba(1, rgb[0], rgb[1], rgb[2], 1.0)
     ctx.set_source(grad)
     ctx.arc(cx, cy, BADGE_R, 0, 2 * math.pi)
     ctx.fill()
 
-    # official logo on top, scaled into the disc
+    # subtle inner rim for depth
+    ctx.set_line_width(1.2)
+    ctx.set_source_rgba(1, 1, 1, 0.28)
+    ctx.arc(cx, cy, BADGE_R - 1.5, 0, 2 * math.pi)
+    ctx.stroke()
+
+    # logo on top — transparent surface, brand-color logo, fills the disc
     surf = _load_logo_surface(agent)
     if surf is not None:
         sw, sh = surf.get_width(), surf.get_height()
         if sw > 0 and sh > 0:
-            scale = (BADGE_R * 1.5) / max(sw, sh)
+            # Fill the disc diameter (slightly padded so logo doesn't clip)
+            target_size = (BADGE_R - 1) * 2.0
+            scale = target_size / sw
             ctx.save()
             ctx.translate(cx, cy)
             ctx.scale(scale, scale)
@@ -346,11 +562,11 @@ def _badge(ctx: cairo.Context, cx: float, cy: float, agent: str):
             ctx.paint()
             ctx.restore()
     else:
-        # fallback: letter
+        # fallback: agent letter
         label = agent[0].upper()
         ctx.set_source_rgba(1, 1, 1, 0.95)
         ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-        ctx.set_font_size(BADGE_R * 1.15)
+        ctx.set_font_size(BADGE_R * 1.1)
         xb, yb, w, h, _dx, _dy = ctx.text_extents(label)
         ctx.move_to(cx - w / 2 - xb, cy - h / 2 - yb)
         ctx.show_text(label)
@@ -372,18 +588,37 @@ class LightPanel(Gtk.DrawingArea):
         w = n * COL_W + (n - 1) * COL_GAP
         h = COL_H
 
-        # translucent rounded panel
+        # 1. Outer drop shadow (subtle, behind panel)
         ctx.set_operator(cairo.OPERATOR_SOURCE)
         ctx.set_source_rgba(0, 0, 0, 0)
         ctx.paint()
         ctx.set_operator(cairo.OPERATOR_OVER)
-        _rounded_rect(ctx, 0, 0, w, h, PANEL_RADIUS)
-        ctx.set_source_rgba(0.05, 0.05, 0.08, 0.72)
-        ctx.fill()
-        ctx.set_line_width(1.0)
-        ctx.set_source_rgba(1, 1, 1, 0.08)
-        _rounded_rect(ctx, 0.5, 0.5, w - 1, h - 1, PANEL_RADIUS)
-        ctx.stroke()
+
+        # Drop shadow (multi-pass blur approximation)
+        for off, alpha in [(4, 0.18), (2, 0.30), (1, 0.40)]:
+            _rounded_rect(ctx, off, off + 2, w, h, PANEL_RADIUS)
+            ctx.set_source_rgba(0, 0, 0, alpha)
+            ctx.fill()
+
+        # 2. Per-column card backgrounds (rounded, with subtle gradient)
+        for i in range(n):
+            cx_card = i * (COL_W + COL_GAP)
+            # shadow
+            _rounded_rect(ctx, cx_card + 1, 3, COL_W, h, PANEL_RADIUS)
+            ctx.set_source_rgba(0, 0, 0, 0.5)
+            ctx.fill()
+            # card body
+            _rounded_rect(ctx, cx_card, 0, COL_W, h, PANEL_RADIUS)
+            grad = cairo.LinearGradient(0, 0, 0, h)
+            grad.add_color_stop_rgba(0, 0.14, 0.15, 0.20, 0.92)
+            grad.add_color_stop_rgba(1, 0.06, 0.06, 0.10, 0.94)
+            ctx.set_source(grad)
+            ctx.fill()
+            # top inner highlight
+            _rounded_rect(ctx, cx_card + 0.5, 0.5, COL_W - 1, h - 1, PANEL_RADIUS)
+            ctx.set_source_rgba(1, 1, 1, 0.08)
+            ctx.set_line_width(1.0)
+            ctx.stroke()
 
         now = time.time()
         chase_phase = (now * 1000 / CHASE_PERIOD_MS) % 1.0
@@ -392,24 +627,10 @@ class LightPanel(Gtk.DrawingArea):
         for i, s in enumerate(sess):
             cx = COL_W / 2 + i * (COL_W + COL_GAP)
 
-            # session name below the badge, above the lights (small, dim)
-            if s.label:
-                ctx.set_source_rgba(1, 1, 1, 0.85)
-                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
-                                     cairo.FONT_WEIGHT_BOLD)
-                ctx.set_font_size(10)
-                xb, yb, tw, th, _dx, _dy = ctx.text_extents(s.label)
-                ctx.move_to(cx - tw / 2 - xb, BADGE_Y + BADGE_R + 10 - yb)
-                ctx.show_text(s.label)
-
-            # badge
-            _badge(ctx, cx, BADGE_Y, s.agent)
-
-            # lights
+            # 4a. Inline 3 lights at top (horizontal)
             if s.state == "busy":
-                # OpenCode-style chaser: lights 0→1→2→1→0, blue.
-                # Triangle wave over 3 positions, period = CHASE_PERIOD_MS.
-                tri = 2.0 - abs(2.0 - (chase_phase * 4.0) % 4.0)   # 0..2..0
+                # chaser: 0 → 1 → 2 → 1 → 0, blue
+                tri = 2.0 - abs(2.0 - (chase_phase * 4.0) % 4.0)
                 cur = min(2, max(0, int(round(tri))))
                 layout = [("dim", 0), ("dim", 1), ("dim", 2)]
                 layout[cur] = ("blue", cur)
@@ -423,14 +644,72 @@ class LightPanel(Gtk.DrawingArea):
                 layout = [("dim", 0), ("dim", 1), ("dim", 2)]
 
             for color, idx in layout:
-                cy = LIGHTS_TOP + idx * SPACING
+                lx = cx + (idx - 1) * LIGHTS_X_STEP
                 rgb = STATUS_COLORS[color]
                 alpha = 1.0
                 if color == "dim":
-                    alpha = 0.55
+                    alpha = 0.40
                 elif s.state == "failure" and color == "red":
                     alpha = blink
-                _light(ctx, cx, cy, rgb, alpha, LIGHT_R)
+                _light(ctx, lx, LIGHTS_Y, rgb, alpha, LIGHT_R)
+
+            # 4b. Big badge
+            _badge(ctx, cx, BADGE_Y, s.agent)
+
+            # 4c. Model name below the badge (or agent name fallback)
+            model_label = s.model or s.agent.upper()
+            if len(model_label) > 10:
+                model_label = model_label[:9] + "…"
+            ctx.set_source_rgba(1, 1, 1, 0.85)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                                 cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(8)
+            xb, yb, tw, th, _dx, _dy = ctx.text_extents(model_label)
+            ctx.move_to(cx - tw / 2 - xb, BADGE_Y + BADGE_R + 16 - yb)
+            ctx.show_text(model_label)
+
+            # 4d. Bottom line: state text (left) + uptime (right)
+            state_text = {
+                "busy":       "running",
+                "needs_perm": "waiting",
+                "success":    "done",
+                "failure":    "failed",
+                "idle":       "idle",
+            }.get(s.state, "idle")
+            state_color = {
+                "busy":       (0.55, 0.85, 1.00),
+                "needs_perm": (1.00, 0.82, 0.18),
+                "success":    (0.34, 0.85, 0.46),
+                "failure":    (1.00, 0.34, 0.36),
+                "idle":       (0.55, 0.55, 0.65),
+            }.get(s.state, (0.55, 0.55, 0.65))
+
+            # uptime
+            uptime_text = ""
+            if s.start_ts > 0:
+                up = max(0, int(now - s.start_ts))
+                if up < 3600:
+                    uptime_text = f"{up // 60:02d}:{up % 60:02d}"
+                else:
+                    uptime_text = f"{up // 3600}:{(up % 3600) // 60:02d}"
+
+            ctx.set_source_rgba(*state_color, 0.95)
+            ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                                 cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(8)
+            xb, yb, tw, th, _dx, _dy = ctx.text_extents(state_text)
+            ctx.move_to(cx - tw / 2 - xb, h - PANEL_PAD - yb)
+            ctx.show_text(state_text)
+
+            if uptime_text:
+                ctx.set_source_rgba(1, 1, 1, 0.45)
+                ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
+                                     cairo.FONT_WEIGHT_NORMAL)
+                ctx.set_font_size(7)
+                xb, yb, tw, th, _dx, _dy = ctx.text_extents(uptime_text)
+                ctx.move_to(cx - tw / 2 - xb, h - PANEL_PAD - 10 - yb)
+                ctx.show_text(uptime_text)
+
         return False
 
 
@@ -474,7 +753,7 @@ class LightWindow(Gtk.Window):
             x, y = self.get_position()
             self._drag_start_win_xy = (x, y)
             self._drag_active = False
-            Gtk.grab_add(self)
+            self.grab_add()
             return True
         if event.button == 3:
             self._ack_at(event.x)
@@ -497,7 +776,7 @@ class LightWindow(Gtk.Window):
 
     def _on_btn_release(self, widget, event):
         if event.button == 1 and self._drag_start_xy is not None:
-            Gtk.grab_remove(self)
+            self.grab_remove()
             if not self._drag_active:
                 self._ack_at(event.x)
             self._drag_start_xy = None
@@ -524,6 +803,10 @@ class LightWindow(Gtk.Window):
             return None
         idx = int(x // (COL_W + COL_GAP))
         return order[idx] if 0 <= idx < len(order) else None
+
+    def _hit_test(self, x: float, y: float = 14) -> str | None:
+        """Hit-test the click location. Returns the session key or None."""
+        return self._column_at(x)
 
     def _ack_at(self, x: float):
         key = self._column_at(x)
@@ -642,6 +925,326 @@ def _log(msg: str):
 
 
 # ──── main ───────────────────────────────────────────────────────
+# ──── settings window ────────────────────────────────────────────
+_active_settings_window = None
+
+
+def _open_settings_window(parent):
+    """Open (or raise) the settings window. Singleton — one window at a time."""
+    global _active_settings_window
+    win = _active_settings_window
+    if win is not None and win.get_visible():
+        win.present()
+        return
+    if win is not None:
+        _active_settings_window = None
+    win = SettingsWindow(parent)
+    win.connect("destroy", lambda *_: _on_settings_closed())
+    _active_settings_window = win
+
+
+def _on_settings_closed():
+    global _active_settings_window
+    _active_settings_window = None
+
+
+def _play_wav_async(path):
+    """Best-effort fire-and-forget playback of a WAV file via paplay."""
+    def _run():
+        vol = get_settings().get("tts_volume", 0.7)
+        try:
+            subprocess.Popen(
+                ["paplay", f"--volume={int(vol * 65535)}", path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            pass
+    import threading
+    threading.Thread(target=_run, daemon=True).start()
+
+
+class SettingsWindow(Gtk.Window):
+    """Popup with sound/TTS/audio controls. Opened by clicking the gear icon."""
+
+    def __init__(self, parent):
+        super().__init__()
+        self.set_title("hermes-light · settings")
+        self.set_resizable(False)
+        self.set_decorated(True)
+        self.set_keep_above(True)
+        self.set_type_hint(Gdk.WindowTypeHint.DIALOG)
+        self.set_modal(False)
+        self.set_default_size(380, -1)
+
+        px, py = parent.get_position()
+        self.move(px + 80, py - 20)
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.set_margin_top(14)
+        outer.set_margin_bottom(14)
+        outer.set_margin_start(16)
+        outer.set_margin_end(16)
+
+        outer.pack_start(self._section_label("声音"), False, False, 0)
+        self.chk_sound = Gtk.CheckButton(label="启用声音提示（start / done 当当）")
+        self.chk_sound.set_active(get_settings().get("sound_enabled", True))
+        self.chk_sound.connect("toggled", self._on_sound_toggled)
+        outer.pack_start(self.chk_sound, False, False, 4)
+
+        outer.pack_start(self._section_label("TTS 语音播报"), False, False, 8)
+        self.chk_tts = Gtk.CheckButton(label="启用 TTS 中文播报（任务完成 / 需要授权）")
+        self.chk_tts.set_active(get_settings().get("tts_enabled", True))
+        self.chk_tts.connect("toggled", self._on_tts_toggled)
+        outer.pack_start(self.chk_tts, False, False, 4)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        vbox.pack_start(Gtk.Label(label="语音:"), False, False, 0)
+        self.voice_combo = Gtk.ComboBoxText()
+        current_voice = get_settings().get("tts_voice", "zh-CN-XiaoxiaoNeural")
+        active_idx = 0
+        for i, v in enumerate(TTS_VOICES):
+            self.voice_combo.append_text(v)
+            if v == current_voice:
+                active_idx = i
+        self.voice_combo.set_active(active_idx)
+        self.voice_combo.connect("changed", self._on_voice_changed)
+        vbox.pack_start(self.voice_combo, True, True, 0)
+        outer.pack_start(vbox, False, False, 4)
+
+        vbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        vbox.pack_start(Gtk.Label(label="音量:"), False, False, 0)
+        self.vol_adj = Gtk.Adjustment(
+            value=get_settings().get("tts_volume", 0.7),
+            lower=0.0, upper=1.0, step_increment=0.05, page_increment=0.1, page_size=0,
+        )
+        self.vol_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.vol_adj)
+        self.vol_scale.set_digits(2)
+        self.vol_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        self.vol_adj.connect("value-changed", self._on_volume_changed)
+        vbox.pack_start(self.vol_scale, True, True, 0)
+        outer.pack_start(vbox, False, False, 4)
+
+        test_label = Gtk.Label(xalign=0)
+        test_label.set_markup("<b>试听报告音：</b>")
+        outer.pack_start(test_label, False, False, 6)
+
+        grid = Gtk.Grid()
+        grid.set_row_spacing(4)
+        grid.set_column_spacing(6)
+        test_reports = [
+            ("Agent 任务完成", "task_done"),
+            ("Hermes 完成", "hermes_done"),
+            ("Claude 完成", "claude_done"),
+            ("OpenCode 完成", "opencode_done"),
+            ("需要授权", "needs_perm"),
+        ]
+        for i, (label, key) in enumerate(test_reports):
+            btn = Gtk.Button(label=label)
+            btn.connect("clicked", self._on_test, key)
+            grid.attach(btn, i % 3, i // 3, 1, 1)
+        outer.pack_start(grid, False, False, 0)
+
+        self.btn_regen = Gtk.Button(label="🔄 用当前语音重新生成所有报告音")
+        self.btn_regen.connect("clicked", self._on_regen)
+        outer.pack_start(self.btn_regen, False, False, 8)
+
+        self.status_label = Gtk.Label(xalign=0)
+        self.status_label.set_markup('<span foreground="#888888">就绪</span>')
+        outer.pack_start(self.status_label, False, False, 6)
+
+        close = Gtk.Button(label="关闭")
+        close.connect("clicked", lambda _: self.destroy())
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        hbox.pack_end(close, False, False, 0)
+        outer.pack_end(hbox, False, False, 0)
+
+        self.add(outer)
+        self.show_all()
+
+    def _section_label(self, text):
+        l = Gtk.Label(xalign=0)
+        l.set_markup(f"<b>{text}</b>")
+        l.set_margin_top(4)
+        l.set_margin_bottom(2)
+        return l
+
+    def _on_sound_toggled(self, btn):
+        update_settings(sound_enabled=btn.get_active())
+        self._set_status(f"声音提示: {'开' if btn.get_active() else '关'}")
+
+    def _on_tts_toggled(self, btn):
+        update_settings(tts_enabled=btn.get_active())
+        self._set_status(f"TTS 播报: {'开' if btn.get_active() else '关'}")
+
+    def _on_voice_changed(self, combo):
+        voice = combo.get_active_text()
+        if voice:
+            update_settings(tts_voice=voice)
+            self._set_status(f"语音 = {voice}")
+
+    def _on_volume_changed(self, adj):
+        update_settings(tts_volume=adj.get_value())
+
+    def _on_test(self, btn, report_key):
+        wav = os.path.join(TTS_WAV_DIR, TTS_REPORTS.get(report_key, ""))
+        if not os.path.exists(wav):
+            self._set_status(f"❌ 缺失: {wav}")
+            return
+        _play_wav_async(wav)
+        self._set_status(f"▶ 播放 {report_key}")
+
+    def _on_regen(self, btn):
+        btn.set_sensitive(False)
+        self._set_status("重新生成中…")
+        import threading
+        def work():
+            voice = get_settings().get("tts_voice", "zh-CN-XiaoxiaoNeural")
+            texts = {
+                "task_done":    "Agent 任务已完成",
+                "hermes_done":  "Hermes 已完成",
+                "claude_done":  "Claude 已完成",
+                "opencode_done": "OpenCode 已完成",
+                "needs_perm":   "Agent 需要授权",
+            }
+            for key, text in texts.items():
+                tmp_mp3 = os.path.join(TTS_WAV_DIR, f".tmp_{key}.mp3")
+                wav     = os.path.join(TTS_WAV_DIR, TTS_REPORTS[key])
+                try:
+                    subprocess.run(
+                        ["edge-tts", "--voice", voice, "--text", text, "--write-media", tmp_mp3],
+                        capture_output=True, check=True, timeout=20,
+                    )
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "22050", "-ac", "1", wav + ".new"],
+                        capture_output=True, check=True, timeout=20,
+                    )
+                    os.replace(wav + ".new", wav)
+                except Exception as e:
+                    GLib.idle_add(self._set_status, f"❌ {key} 失败: {e}")
+                    GLib.idle_add(btn.set_sensitive, True)
+                    return
+                finally:
+                    if os.path.exists(tmp_mp3):
+                        os.remove(tmp_mp3)
+            GLib.idle_add(self._set_status, f"✓ 5 个报告音已用 {voice} 重新生成")
+            GLib.idle_add(btn.set_sensitive, True)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _set_status(self, msg):
+        self.status_label.set_markup(f'<span foreground="#a0d090">{msg}</span>')
+
+
+class HermesTrayIcon:
+    """System tray icon (GNOME top-bar notification area).
+
+    Uses AyatanaAppIndicator3 — appears in the GNOME top bar via the
+    ubuntu-appindicators extension. Click opens the settings window.
+    The icon color reflects aggregate state across all sessions.
+    """
+
+    def __init__(self, parent_window):
+        self.parent = parent_window
+        self.indicator = None
+        self._build_menu()
+        self._init_indicator()
+
+    def _build_menu(self):
+        """Right-click menu shown in the top bar."""
+        self.menu = Gtk.Menu()
+
+        item = Gtk.MenuItem(label="hermes-light · Settings")
+        item.connect("activate", lambda *_: _open_settings_window(self.parent))
+        self.menu.append(item)
+
+        item = Gtk.MenuItem(label="Quit")
+        item.connect("activate", lambda *_: Gtk.main_quit())
+        self.menu.append(item)
+
+        self.menu.show_all()
+
+    def _init_indicator(self):
+        gi.require_version("AyatanaAppIndicator3", "0.1")
+        from gi.repository import AyatanaAppIndicator3  # noqa: F811
+
+        # Generate a per-state icon as a temp PNG so we can update by file path
+        self.indicator = AyatanaAppIndicator3.Indicator.new(
+            "hermes-light",
+            "hermes-light-idle",
+            AyatanaAppIndicator3.IndicatorCategory.APPLICATION_STATUS,
+        )
+        self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
+        self.indicator.set_menu(self.menu)
+        self.indicator.set_title("hermes-light")
+
+        # Generate the initial icon
+        self._refresh_icon("idle")
+
+    def _refresh_icon(self, aggregate_state: str) -> None:
+        """Regenerate the icon PNG for the given aggregate state and update."""
+        # Map state → color
+        colors = {
+            "busy":       (0.40, 0.75, 1.00),
+            "needs_perm": (1.00, 0.82, 0.18),
+            "success":    (0.34, 0.85, 0.46),
+            "failure":    (1.00, 0.34, 0.36),
+            "idle":       (0.55, 0.55, 0.65),
+        }
+        color = colors.get(aggregate_state, colors["idle"])
+        out_path = f"/tmp/hermes-light-{aggregate_state}.png"
+
+        # Use cairo to render a 32x32 icon: dark circle with bright center dot
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, 32, 32)
+        ctx = cairo.Context(surf)
+        # transparent background
+        ctx.set_operator(cairo.OPERATOR_CLEAR)
+        ctx.paint()
+        ctx.set_operator(cairo.OPERATOR_OVER)
+        # dark outer ring
+        ctx.set_source_rgba(0.10, 0.10, 0.14, 1.0)
+        ctx.arc(16, 16, 14, 0, 2 * math.pi)
+        ctx.fill()
+        # bright center
+        ctx.set_source_rgba(*color, 1.0)
+        ctx.arc(16, 16, 8, 0, 2 * math.pi)
+        ctx.fill()
+        # specular highlight
+        ctx.set_source_rgba(1, 1, 1, 0.6)
+        ctx.arc(13, 13, 3, 0, 2 * math.pi)
+        ctx.fill()
+
+        surf.write_to_png(out_path)
+
+        # Update the indicator's icon
+        import os
+        if os.path.exists(out_path):
+            try:
+                # Pass full path as the icon name
+                self.indicator.set_icon_full(out_path, aggregate_state)
+            except Exception:
+                pass
+
+    def refresh_from_sessions(self) -> None:
+        """Compute aggregate state and update icon."""
+        sess = snapshot()
+        if not sess:
+            self._refresh_icon("idle")
+            return
+        states = {s.state for s in sess}
+        if "failure" in states:
+            aggregate = "failure"
+        elif "needs_perm" in states:
+            aggregate = "needs_perm"
+        elif "busy" in states:
+            aggregate = "busy"
+        elif "success" in states:
+            aggregate = "success"
+        else:
+            aggregate = "idle"
+        self._refresh_icon(aggregate)
+
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bg", action="store_true")
@@ -660,8 +1263,8 @@ def main():
     geom = mon.get_geometry()
     win.move(geom.x + geom.width - 220, geom.y + 40)
 
-    for key, label, agent in discover_sessions():
-        add_or_update(key, label, agent)
+    for key, label, agent, pid in discover_sessions():
+        add_or_update(key, label, agent, pid)
     refresh_window_size(win)
     win.show_all()
 
@@ -672,14 +1275,25 @@ def main():
 
     def rediscover():
         discovered = discover_sessions()
-        alive = {k for k, _l, _a in discovered}
-        for key, label, agent in discovered:
-            add_or_update(key, label, agent)
+        alive = {k for k, _l, _a, _p in discovered}
+        for key, label, agent, pid in discovered:
+            add_or_update(key, label, agent, pid)
         drop_if_missing(alive)
+        autofade_success()
         refresh_window_size(win)
-        _log(f"discover: {[(s.key, s.agent, s.state) for s in snapshot()]}")
+        _log(f"discover: {[(s.key, s.agent, s.model or '-', s.state) for s in snapshot()]}")
+        if tray is not None:
+            tray.refresh_from_sessions()
         return True
     GLib.timeout_add_seconds(3, rediscover)
+
+    # Initialize the system tray icon (GNOME top bar / notification area)
+    try:
+        tray = HermesTrayIcon(win)
+        _log("tray icon initialized")
+    except Exception as e:
+        tray = None
+        _log(f"tray init failed: {e}")
 
     socket_server(_log)
     _log(f"hermes-light started, pid={os.getpid()}")
