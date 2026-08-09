@@ -67,6 +67,14 @@ QUIET_SECS = 10.0        # FALLBACK ONLY: hook file lost + this long quiet →
                          # assume done. Primary completion signal is the hook
                          # "done" state (final answer via post_api_request,
                          # no tool calls). 10s is a recovery fallback only.
+QUIET_FALLBACK_SECS = 8.0  # FALLBACK ONLY: hook-less session (opencode/claude
+                           # or Hermes launched without the wrapper). After this
+                           # many seconds of total quiet (TCP queue empty AND
+                           # CPU below threshold), treat the current turn as
+                           # done → fire audio + green light. Picked to be
+                           # shorter than the natural inter-keystroke pace of
+                           # a multi-step tool run so a brief idle between
+                           # tools doesn't false-trigger.
 POLL_INTERVAL = 0.25     # sampling cadence
 SAMPLE_WINDOW = 1.0      # ps sample window in seconds (cumulative)
 VOLUME = 0.6
@@ -552,24 +560,77 @@ def _save_numbers(data: dict) -> None:
         pass
 
 
-def assign_number(pid: int, agent: str) -> int:
-    """Assign (or recall) the stable session number for a pid, first-seen order.
+def assign_number(pid: int, agent: str = "hermes") -> int:
+    """Assign (or recall) the stable session number for a pid.
 
-    Existing sessions keep their number; new sessions get max+1. A pid whose
-    session ended and restarted (new pid) gets a fresh number — numbers are
-    not recycled while a session is alive.
+    Strategy:
+      - If this pid already has a number, reuse it.
+      - Otherwise pick the LOWEST positive integer not currently held by ANY
+        pid in the numbers file — alive or dead. This means:
+          * If #1's pid died and reap hasn't run yet, #1 is still reserved
+            (its entry exists), so a new pid skips it and takes #2. Once
+            reap clears the dead entry, #1 becomes available again.
+          * Dead pids that have been reaped (entry removed) free their
+            number, so a brand-new session reuses the smallest gap.
+          * If #1..#5 are all live (or all reserved by stale entries), the
+            new pid gets #6 (max+1).
+      - Net effect: numbers grow up as sessions accumulate, and shrink back
+        down as old sessions die and get reaped.
     """
     with _numbers_lock:
         data = _load_numbers()
         key = str(pid)
         if key in data:
             return int(data[key]["num"])
-        # next free number = max existing + 1
-        nums = [int(v["num"]) for v in data.values()]
-        num = max(nums, default=0) + 1
+
+        taken = {int(v["num"]) for v in data.values()}
+        # Smallest positive int not in `taken`.
+        num = min(set(range(1, max(taken, default=0) + 2)) - taken)
+
         data[key] = {"num": num, "agent": agent, "first_seen": time.time()}
         _save_numbers(data)
         return num
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is still a runnable process."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def reap_dead_numbers() -> None:
+    """Drop entries whose pid is gone from the persistent numbers file.
+
+    Called on every iteration of the main loop. Keeping dead entries lets us
+    re-use their number across watcher restarts while still respecting the
+    "release on close" rule within a single run; pruning them forever-bound
+    a number to a vanished session, which is what we want to avoid.
+
+    We DO NOT remove an entry whose pid was just reaped in *this* iteration
+    without giving `assign_number` a chance to recall it — but since we only
+    prune entries whose process is verifiably dead, that race is harmless:
+    the next call to assign_number will pick the same freed number anyway.
+    """
+    with _numbers_lock:
+        data = _load_numbers()
+        changed = False
+        for k in list(data.keys()):
+            try:
+                pid_i = int(k)
+            except ValueError:
+                continue
+            if not _pid_alive(pid_i):
+                # Keep the slot's "num" so assign_number can see it as a
+                # candidate; but the entry itself becomes useless since its
+                # pid is gone. Drop it — assign_number consults only alive
+                # pids, and a dead pid's number is by definition free.
+                del data[k]
+                changed = True
+        if changed:
+            _save_numbers(data)
 
 
 def session_num(pid: int) -> int | None:
@@ -750,6 +811,8 @@ def run(stop_event: threading.Event) -> None:
                 tracked.pop(pid, None)
 
             current = discover_hermes_pids(self_pid)
+            # Free numbers held by dead pids so a new session can reuse them.
+            reap_dead_numbers()
             # remove stale
             for pid in list(tracked):
                 if pid not in current:
@@ -761,7 +824,10 @@ def run(stop_event: threading.Event) -> None:
                     tracked[pid] = st
                     st.last_state = "unknown"   # don't fire on first sight
                     st.since = time.time()
-                    st.last_activity_ts = 0.0           # no activity history yet
+                    st.last_activity_ts = time.time()  # seed so the
+                        # fallback-quiet timer has a sane baseline for this
+                        # session (otherwise busy→idle right after discovery
+                        # would compare against 0.0 → instant done false-fire)
                     # Assign stable session number in first-seen order.
                     st.session_num = assign_number(pid, st.agent)
                     _log(f"  + watching pid {pid} ({st.pty}) #{st.session_num}")
@@ -793,8 +859,15 @@ def run(stop_event: threading.Event) -> None:
                         st.last_hook_ts = now
                     continue
                 if st.last_state == "needs_perm":
-                    # Approval answered (hook file gone / busy again) — back to work
+                    # Approval answered (hook file gone / busy again) — back to work.
+                    # IMPORTANT: push "busy" to GUI immediately so the needs_perm
+                    # state doesn't get stuck — GUI's add_or_update only updates
+                    # out of needs_perm when recent_push=False (12s window), and
+                    # the GUI also relies on this push to break out of its
+                    # "respect the last push" branch. Without this, the GUI keeps
+                    # showing needs_perm until the next hook event overwrites it.
                     _log(f"  ↻ pid {pid} ({st.pty}) approval resolved → busy")
+                    _push_gui_state("busy", st.pty, pid)
                     st.last_state = "busy"
                     st.since = now
                 if hstate == "busy":
@@ -865,6 +938,11 @@ def run(stop_event: threading.Event) -> None:
                     st.last_state = observed
                     st.since = now
                     if observed == "busy":
+                        # Reset the fallback-quiet baseline so the busy→idle
+                        # transition that follows has a fresh window to wait
+                        # through (instead of comparing against the watcher's
+                        # startup time, which would fire "done" immediately).
+                        st.last_activity_ts = now
                         _log(f"  ▲ pid {pid} ({st.pty}) first sight BUSY")
                         _alert("start", st.pty, pid)
                         st.last_alert_at = now
@@ -875,15 +953,28 @@ def run(stop_event: threading.Event) -> None:
                 if observed == st.last_state:
                     continue
                 if st.last_state == "busy" and observed == "idle":
-                    # NO done announcement for hook-less (fallback) sessions —
-                    # we can't reliably distinguish "gap inside a multi-step
-                    # turn" from "task finished" without Hermes' own final-
-                    # answer signal. But DO push idle to the GUI so the light
-                    # turns grey promptly after work stops (no long busy lag).
-                    _log(f"  · pid {pid} ({st.pty}) busy → idle (silent)")
-                    _push_gui_state("idle", st.pty, pid)
-                    st.last_state = "idle"
-                    st.since = now
+                    # Fallback path (hook-less sessions, e.g. opencode/claude or
+                    # a Hermes launch that bypassed the wrapper). We CAN'T tell
+                    # "gap inside a multi-step turn" from "task finished" without
+                    # the agent's own final-answer signal — so we hold the busy
+                    # state for QUIET_FALLBACK_SECS of total quiet before we
+                    # commit to "done". If new TCP/CPU activity resumes inside
+                    # that window, last_activity_ts refreshes and we stay busy.
+                    quiet_for = now - st.last_activity_ts
+                    if st.last_activity_ts > 0 and quiet_for >= QUIET_FALLBACK_SECS:
+                        # Long quiet on a hook-less session → treat as done.
+                        # Push success (green) + play done audio + TTS report.
+                        _log(f"  ✓ pid {pid} ({st.pty}) fallback quiet {quiet_for:.0f}s → DONE")
+                        _alert("done", st.pty, pid)
+                        st.last_state = "success"
+                        st.since = now
+                    else:
+                        # Short gap — just mark idle silently and let the GUI
+                        # turn grey, without firing done (we don't trust it yet).
+                        _log(f"  · pid {pid} ({st.pty}) busy → idle (quiet {quiet_for:.1f}s, silent)")
+                        _push_gui_state("idle", st.pty, pid)
+                        st.last_state = "idle"
+                        st.since = now
                 elif st.last_state in ("idle", "success") and observed == "busy":
                     # New activity (TCP/CPU) — back to work. From success this
                     # is a NEW turn (user sent a message); from idle a resume.
