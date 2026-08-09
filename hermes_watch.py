@@ -59,6 +59,8 @@ BUSY_THRESHOLD = 40.0    # CPU% for real work (tool runs, compiles); TUI
                          # signal; this high CPU bar is a secondary fallback.
 IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue (legacy)
 BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue (legacy)
+FALLBACK_BUSY_HOLD = 3.0  # fallback: keep busy this long after last socket/CPU activity
+                          # (absorbs stream-drain gaps between polls)
 IDLE_CONFIRM_SECS = 20.0  # fallback: busy→idle must persist this long before done
                           # (absorbs TCP/CPU flapping on hook-less sessions)
 QUIET_SECS = 30.0        # FALLBACK ONLY: hook file lost + this long quiet →
@@ -87,6 +89,7 @@ class ProcState:
     last_activity_ts: float = 0.0        # last time CPU/IO showed activity (fallback)
     agent: str = "hermes"                # hermes | claude | opencode
     session_num: int = 0                 # stable number in first-seen order
+    tcp_bytes_prev: int | None = None    # last TCP traffic sample (delta detect)
 
 
 # ──────────────────────────── audio ────────────────────────────
@@ -643,9 +646,10 @@ def _socket_inodes(pid: int) -> set[str]:
 def _has_live_tcp(pid: int) -> bool:
     """True if the process has an ESTABLISHED TCP connection.
 
-    Agents calling an LLM API hold an ESTABLISHED connection while streaming.
-    Local TUI animation / prompt rendering opens no TCP, so this cleanly
-    separates "working" from "idle at the prompt" without rchar noise.
+    Reads /proc/net/tcp directly (no sudo needed) and matches the process's
+    socket inodes. A connection alone does NOT mean busy — opencode opens a
+    keep-alive connection on launch. Busy requires TRAFFIC on it (see
+    _group_has_live_tcp, which combines connection + rchar growth).
     """
     inodes = _socket_inodes(pid)
     if not inodes:
@@ -664,11 +668,46 @@ def _has_live_tcp(pid: int) -> bool:
     return False
 
 
+def _socket_queue_activity(pid: int) -> int:
+    """Total queued bytes (rx_queue + tx_queue) across the process's live
+    TCP sockets, sampled from /proc/net/tcp.
+
+    rx_queue > 0 while streaming an LLM response (kernel holds unread data).
+    A keep-alive connection that opencode opens on launch has queue 0:0 —
+    no data flowing → idle. This cleanly separates "actually streaming"
+    from "connection exists but nothing is happening".
+    """
+    inodes = _socket_inodes(pid)
+    if not inodes:
+        return 0
+    total = 0
+    try:
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            with open(table) as f:
+                next(f, None)
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 10 and parts[3] == "01" and parts[9] in inodes:
+                        # parts[4] = "tx_queue:rx_queue" (hex)
+                        txrx = parts[4].split(":")
+                        if len(txrx) == 2:
+                            total += int(txrx[0], 16) + int(txrx[1], 16)
+    except OSError:
+        pass
+    return total
+
+
 def _group_has_live_tcp(state: ProcState) -> bool:
-    """TCP check across the process group (parent + children)."""
-    if _has_live_tcp(state.pid):
-        return True
-    return any(_has_live_tcp(c) for c in state.children)
+    """True if the process group has TCP sockets WITH queued data.
+
+    A connection alone (opencode's launch keep-alive) is NOT busy. Busy
+    means data is actually queued/streaming on a socket — i.e. the agent
+    is talking to an LLM API or a tool is doing network I/O.
+    """
+    total = _socket_queue_activity(state.pid)
+    for c in state.children:
+        total += _socket_queue_activity(c)
+    return total > 0
 
 
 def group_io_delta(state: ProcState) -> int:
@@ -723,7 +762,7 @@ def run(stop_event: threading.Event) -> None:
                     tracked[pid] = st
                     st.last_state = "unknown"   # don't fire on first sight
                     st.since = time.time()
-                    st.last_activity_ts = time.time()   # seed: avoid now-0 blowup
+                    st.last_activity_ts = 0.0           # no activity history yet
                     # Assign stable session number in first-seen order.
                     st.session_num = assign_number(pid, st.agent)
                     _log(f"  + watching pid {pid} ({st.pty}) #{st.session_num}")
@@ -804,38 +843,46 @@ def run(stop_event: threading.Event) -> None:
                 cpu = group_cpu(st)
                 io_delta = group_io_delta(st)
                 tcp = _group_has_live_tcp(st)
-                # PRIMARY: an ESTABLISHED TCP connection = calling an API
-                # (LLM stream). TUI animation has no TCP, so idle-at-prompt
-                # agents (opencode spinner at 15-25% CPU) stay idle.
+                # PRIMARY: socket with queued data = actually streaming from
+                # an API. An opencode that merely opened a keep-alive
+                # connection has queue 0:0 → idle. Sampling is instantaneous,
+                # so a stream that gets drained between polls still keeps the
+                # session busy for FALLBACK_BUSY_HOLD via last_activity_ts.
                 # SECONDARY: sustained high CPU (tool exec, compile, tests).
                 if tcp or cpu >= BUSY_THRESHOLD:
                     st.last_activity_ts = now
                     observed = "busy"
+                elif now - st.last_activity_ts < FALLBACK_BUSY_HOLD:
+                    # Recent activity (stream drained between polls) — keep busy.
+                    observed = "busy"
                 else:
-                    # No TCP + no heavy CPU → idle at the prompt. Immediate.
                     observed = "idle"
                 if debug:
-                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B tcp={tcp} active={tcp or cpu >= BUSY_THRESHOLD} state={st.last_state} → {observed} (fallback)")
+                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B tcp={tcp} state={st.last_state} → {observed} (fallback)")
                 # transitions
                 if st.last_state == "unknown":
-                    # First observation. If the process is already active
-                    # (TCP/CPU), announce busy so the GUI doesn't stay idle.
+                    # First observation. Announce the observed state so the
+                    # GUI never keeps a stale state after a watcher restart.
                     st.last_state = observed
                     st.since = now
                     if observed == "busy":
                         _log(f"  ▲ pid {pid} ({st.pty}) first sight BUSY")
                         _alert("start", st.pty, pid)
                         st.last_alert_at = now
+                    elif observed == "idle":
+                        _log(f"  · pid {pid} ({st.pty}) first sight idle")
+                        _push_gui_state("idle", st.pty, pid)
                     continue
                 if observed == st.last_state:
                     continue
                 if st.last_state == "busy" and observed == "idle":
-                    # NO done announcement for hook-less (fallback) sessions.
-                    # We cannot reliably distinguish "gap inside a multi-step
-                    # turn" from "task truly finished" without Hermes' own
-                    # post_api_request(final answer) signal — TCP/CPU gaps
-                    # caused false completions mid-task. Silent → idle (grey).
-                    # Only hook-driven sessions announce completion.
+                    # NO done announcement for hook-less (fallback) sessions —
+                    # we can't reliably distinguish "gap inside a multi-step
+                    # turn" from "task finished" without Hermes' own final-
+                    # answer signal. But DO push idle to the GUI so the light
+                    # turns grey promptly after work stops (no long busy lag).
+                    _log(f"  · pid {pid} ({st.pty}) busy → idle (silent)")
+                    _push_gui_state("idle", st.pty, pid)
                     st.last_state = "idle"
                     st.since = now
                 elif st.last_state in ("idle", "success") and observed == "busy":
