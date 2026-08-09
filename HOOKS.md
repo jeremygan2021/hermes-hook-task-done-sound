@@ -50,6 +50,9 @@ hooks:
   post_llm_call:
     - command: /home/kali/bin/hermes-hook-status
       timeout: 2
+  post_api_request:
+    - command: /home/kali/bin/hermes-hook-status
+      timeout: 2
   pre_approval_request:
     - command: /home/kali/bin/hermes-hook-status
       timeout: 2

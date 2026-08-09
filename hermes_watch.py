@@ -63,11 +63,10 @@ FALLBACK_BUSY_HOLD = 3.0  # fallback: keep busy this long after last socket/CPU 
                           # (absorbs stream-drain gaps between polls)
 IDLE_CONFIRM_SECS = 20.0  # fallback: busy→idle must persist this long before done
                           # (absorbs TCP/CPU flapping on hook-less sessions)
-QUIET_SECS = 30.0        # FALLBACK ONLY: hook file lost + this long quiet →
+QUIET_SECS = 10.0        # FALLBACK ONLY: hook file lost + this long quiet →
                          # assume done. Primary completion signal is the hook
-                         # "done" state (final answer, no tool calls). 30s is
-                         # long enough that multi-step turn gaps never falsely
-                         # complete, short enough to recover if hooks break.
+                         # "done" state (final answer via post_api_request,
+                         # no tool calls). 10s is a recovery fallback only.
 POLL_INTERVAL = 0.25     # sampling cadence
 SAMPLE_WINDOW = 1.0      # ps sample window in seconds (cumulative)
 VOLUME = 0.6
