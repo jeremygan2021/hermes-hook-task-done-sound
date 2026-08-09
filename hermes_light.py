@@ -175,7 +175,13 @@ TTS_REPORTS = {
     "hermes_done":  "hermes_done.wav",
     "claude_done":  "claude_done.wav",
     "opencode_done": "opencode_done.wav",
-    "needs_perm":   "needs_perm.wav",
+    # Agent-specific needs_perm prompts ("Hermes 需要您的输入" / "Claude 需要您的输入" /
+    # "OpenCode 需要您的输入"); fall back to the generic "needs_perm.wav"
+    # ("需要授权") for unknown agent types.
+    "hermes_needs_perm":   "hermes_needs_perm.wav",
+    "claude_needs_perm":   "claude_needs_perm.wav",
+    "opencode_needs_perm": "opencode_needs_perm.wav",
+    "needs_perm":          "needs_perm.wav",
 }
 
 
@@ -1104,7 +1110,10 @@ class SettingsWindow(Gtk.Window):
             ("Hermes 完成", "hermes_done"),
             ("Claude 完成", "claude_done"),
             ("OpenCode 完成", "opencode_done"),
-            ("需要授权", "needs_perm"),
+            ("Hermes 需要您的输入", "hermes_needs_perm"),
+            ("Claude 需要您的输入", "claude_needs_perm"),
+            ("OpenCode 需要您的输入", "opencode_needs_perm"),
+            ("需要授权(generic)", "needs_perm"),
         ]
         for i, (label, key) in enumerate(test_reports):
             btn = Gtk.Button(label=label)

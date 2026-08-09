@@ -649,14 +649,23 @@ TTS_REPORT_FILES = {
     "hermes_done":  "hermes_done.wav",
     "claude_done":  "claude_done.wav",
     "opencode_done": "opencode_done.wav",
-    "needs_perm":   "needs_perm.wav",
+    # needs_perm: agent-specific ("Hermes 需要您的输入" / "Claude 需要您的输入" /
+    # "OpenCode 需要您的输入"). Fallback to the generic "needs_perm.wav"
+    # ("需要授权") only when agent isn't one of the three known ones.
+    "hermes_needs_perm":   "hermes_needs_perm.wav",
+    "claude_needs_perm":   "claude_needs_perm.wav",
+    "opencode_needs_perm": "opencode_needs_perm.wav",
+    "needs_perm":          "needs_perm.wav",
 }
 
 
 def _tts_report_for(agent: str, event: str) -> str | None:
     """Pick the TTS wav for an agent+event. Returns absolute path or None."""
     if event == "needs_perm":
-        key = "needs_perm"
+        # Prefer the agent-specific prompt so the user hears "Hermes 需要您的输入"
+        # (etc.) instead of a generic "需要授权". Fall back to the generic
+        # wav only for unknown agent types.
+        key = f"{agent}_needs_perm" if agent in ("hermes", "claude", "opencode") else "needs_perm"
     elif event == "done":
         key = f"{agent}_done" if agent in ("hermes", "claude", "opencode") else "task_done"
     else:

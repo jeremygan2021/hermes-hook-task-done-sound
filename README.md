@@ -20,9 +20,14 @@ It watches every agent CLI process and signals on four events:
 
 - **busy** (LLM streaming / tool exec / subagent running) → `start.wav` (滴滴)
 - **needs_perm** (tool call awaiting your approval in the terminal) →
-  `needs_perm.wav` ("等待授权")
+  agent-specific TTS: `hermes_needs_perm.wav` ("Hermes 需要您的输入"),
+  `claude_needs_perm.wav` ("Claude 需要您的输入"),
+  `opencode_needs_perm.wav` ("OpenCode 需要您的输入");
+  fallback `needs_perm.wav` ("需要授权") for unknown agent types
 - **done** (final answer, whole task finished) → `success.wav` (当当
-  descending 880→660→440 Hz) + GUI light turns **green**
+  descending 880→660→440 Hz) + GUI light turns **green**. With TTS enabled
+  the agent name is announced first ("六号" / "Hermes 已完成") so you can
+  tell which session finished when several are running.
 - **failure** → silent (you see the failed response in the terminal)
 
 State is per-process, keyed by `<tty>:<pid>`. Rate-limited to 1 alert per
@@ -87,6 +92,9 @@ session with its badge, model name, uptime, and current state.
 | `start.wav` | 滴滴 (4 × 70 ms beeps at 880 Hz) |
 | `success.wav` | 当当 descending (880 → 660 → 440 Hz, fading volume) |
 | `error.wav` | reserved / unused (failure path is silent) |
+| `hermes_done.wav` / `claude_done.wav` / `opencode_done.wav` | TTS announcement on task complete ("Hermes 已完成" / "Claude 已完成" / "OpenCode 已完成") |
+| `hermes_needs_perm.wav` / `claude_needs_perm.wav` / `opencode_needs_perm.wav` | TTS announcement on tool approval needed ("Hermes 需要您的输入" / etc.) |
+| `needs_perm.wav` | generic fallback TTS ("需要授权") for unknown agent types |
 | `generate_tones.py` | regenerates the WAVs from Python stdlib `wave` + `struct` |
 
 ## Install
@@ -95,6 +103,12 @@ session with its badge, model name, uptime, and current state.
 mkdir -p ~/.local/bin ~/.local/share/hermes-task-sound
 cp hermes_watch.py ~/.local/bin/hermes-watch
 cp start.wav success.wav error.wav ~/.local/share/hermes-task-sound/
+# TTS wavs live in ~/.local/share/hermes-light/tts/wav/, separate dir
+mkdir -p ~/.local/share/hermes-light/tts/wav
+cp hermes_done.wav claude_done.wav opencode_done.wav \
+   hermes_needs_perm.wav claude_needs_perm.wav opencode_needs_perm.wav \
+   needs_perm.wav \
+   ~/.local/share/hermes-light/tts/wav/
 
 # as a systemd user service (survives logout, auto-restarts on crash)
 cp install-service.sh ~/.local/bin/hermes-watch-install
