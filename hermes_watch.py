@@ -59,6 +59,8 @@ BUSY_THRESHOLD = 40.0    # CPU% for real work (tool runs, compiles); TUI
                          # signal; this high CPU bar is a secondary fallback.
 IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue (legacy)
 BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue (legacy)
+IDLE_CONFIRM_SECS = 20.0  # fallback: busy→idle must persist this long before done
+                          # (absorbs TCP/CPU flapping on hook-less sessions)
 QUIET_SECS = 30.0        # FALLBACK ONLY: hook file lost + this long quiet →
                          # assume done. Primary completion signal is the hook
                          # "done" state (final answer, no tool calls). 30s is
@@ -84,6 +86,7 @@ class ProcState:
     last_hook_ts: float = 0.0            # last time an official hook event fired
     last_activity_ts: float = 0.0        # last time CPU/IO showed activity (fallback)
     agent: str = "hermes"                # hermes | claude | opencode
+    session_num: int = 0                 # stable number in first-seen order
 
 
 # ──────────────────────────── audio ────────────────────────────
@@ -143,6 +146,7 @@ def _alert(kind: str, pty: str, pid: int | None = None) -> None:
     elif kind in ("done", "needs_perm"):
         # TTS report takes priority when enabled; else the classic cue
         tts_path = None
+        agent = "hermes"
         if tts_on and pid is not None:
             try:
                 comm = _comm_of(pid)
@@ -151,7 +155,16 @@ def _alert(kind: str, pty: str, pid: int | None = None) -> None:
             agent = detect_agent(pid, comm)
             tts_path = _tts_report_for(agent, kind)
         if tts_path:
-            _play_wav_path(tts_path, settings.get("tts_volume", 0.7))
+            vol = settings.get("tts_volume", 0.7)
+            # Announce the session NUMBER first ("一号"), then the report.
+            num = session_num(pid) if pid is not None else None
+            if num is not None:
+                num_wav = os.path.join(
+                    str(WAV_DIR_TTS), f"num_{num}.wav")
+                if os.path.exists(num_wav):
+                    _play_wav_path(num_wav, vol)
+                    _sleep_gap()
+            _play_wav_path(tts_path, vol)
         elif sound_on:
             _play("success.wav")
 
@@ -453,6 +466,13 @@ def _hook_state(pid: int) -> str | None:
 # ──────────────────────── shared settings ──────────────────────
 SETTINGS_PATH = Path.home() / ".hermes" / "hermes-light-settings.json"
 TTS_WAV_DIR = Path.home() / ".local" / "share" / "hermes-light" / "tts" / "wav"
+WAV_DIR_TTS = TTS_WAV_DIR  # alias used by _alert number announcements
+
+
+def _sleep_gap(seconds: float = 0.7) -> None:
+    """Pause between the number announcement and the report so the two
+    phrases are clearly separated ("二号" … "OpenCode 已完成")."""
+    time.sleep(seconds)
 
 _tts_cache: dict = {}
 
@@ -497,6 +517,67 @@ def detect_agent(pid: int, comm: str) -> str:
     if argv0 in ("opencode", "opencode-cli", "opencode-tui"):
         return "opencode"
     return ""
+
+
+# ──────────────────────── session numbering ─────────────────────
+# Each agent process gets a stable number in first-seen order, persisted
+# across watch restarts so the same session keeps its number. Numbers are
+# never reused while a session is alive.
+NUMBERS_PATH = Path.home() / ".hermes" / "hermes-light-numbers.json"
+_numbers_lock = threading.Lock()
+
+
+def _load_numbers() -> dict:
+    """Load {pid_str: {"num": int, "agent": str, "first_seen": float}}."""
+    try:
+        with open(NUMBERS_PATH) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _save_numbers(data: dict) -> None:
+    try:
+        NUMBERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(NUMBERS_PATH) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, str(NUMBERS_PATH))
+    except OSError:
+        pass
+
+
+def assign_number(pid: int, agent: str) -> int:
+    """Assign (or recall) the stable session number for a pid, first-seen order.
+
+    Existing sessions keep their number; new sessions get max+1. A pid whose
+    session ended and restarted (new pid) gets a fresh number — numbers are
+    not recycled while a session is alive.
+    """
+    with _numbers_lock:
+        data = _load_numbers()
+        key = str(pid)
+        if key in data:
+            return int(data[key]["num"])
+        # next free number = max existing + 1
+        nums = [int(v["num"]) for v in data.values()]
+        num = max(nums, default=0) + 1
+        data[key] = {"num": num, "agent": agent, "first_seen": time.time()}
+        _save_numbers(data)
+        return num
+
+
+def session_num(pid: int) -> int | None:
+    """Current number for a pid, or None if not assigned yet."""
+    with _numbers_lock:
+        data = _load_numbers()
+        key = str(pid)
+        if key in data:
+            return int(data[key]["num"])
+        return None
 
 
 # TTS report wav keyed by agent/event
@@ -643,7 +724,9 @@ def run(stop_event: threading.Event) -> None:
                     st.last_state = "unknown"   # don't fire on first sight
                     st.since = time.time()
                     st.last_activity_ts = time.time()   # seed: avoid now-0 blowup
-                    _log(f"  + watching pid {pid} ({st.pty})")
+                    # Assign stable session number in first-seen order.
+                    st.session_num = assign_number(pid, st.agent)
+                    _log(f"  + watching pid {pid} ({st.pty}) #{st.session_num}")
             # evaluate each
             now = time.time()
             debug = os.getenv("HERMES_WATCH_DEBUG")
@@ -737,7 +820,6 @@ def run(stop_event: threading.Event) -> None:
                 if st.last_state == "unknown":
                     # First observation. If the process is already active
                     # (TCP/CPU), announce busy so the GUI doesn't stay idle.
-                    was_unknown = True
                     st.last_state = observed
                     st.since = now
                     if observed == "busy":
@@ -748,10 +830,12 @@ def run(stop_event: threading.Event) -> None:
                 if observed == st.last_state:
                     continue
                 if st.last_state == "busy" and observed == "idle":
-                    # Truly quiet — the turn finished.
-                    if now - st.last_alert_at >= 3.0:
-                        _alert("done", st.pty, pid)
-                        st.last_alert_at = now
+                    # NO done announcement for hook-less (fallback) sessions.
+                    # We cannot reliably distinguish "gap inside a multi-step
+                    # turn" from "task truly finished" without Hermes' own
+                    # post_api_request(final answer) signal — TCP/CPU gaps
+                    # caused false completions mid-task. Silent → idle (grey).
+                    # Only hook-driven sessions announce completion.
                     st.last_state = "idle"
                     st.since = now
                 elif st.last_state in ("idle", "success") and observed == "busy":

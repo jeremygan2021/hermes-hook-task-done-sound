@@ -247,6 +247,22 @@ def _sentinel_busy(pid: int) -> bool:
     return os.path.exists(f"/tmp/hermes-status-{pid}")
 
 
+NUMBERS_PATH = os.path.expanduser("~/.hermes/hermes-light-numbers.json")
+
+
+def session_num(pid: int) -> int | None:
+    """Stable session number for a pid (first-seen order, persisted)."""
+    try:
+        with open(NUMBERS_PATH) as f:
+            data = json.load(f)
+        key = str(pid)
+        if key in data:
+            return int(data[key]["num"])
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
 _HOOK_STALE_SECS = 60.0
 
 
@@ -704,10 +720,14 @@ class LightPanel(Gtk.DrawingArea):
             # 4b. Big badge
             _badge(ctx, cx, BADGE_Y, s.agent)
 
-            # 4c. Model name below the badge (or agent name fallback)
+            # 4c. Model name below the badge (or agent name fallback),
+            #     prefixed with the stable session number (#N).
+            num = session_num(s.pid) if s.pid else None
             model_label = s.model or s.agent.upper()
             if len(model_label) > 10:
                 model_label = model_label[:9] + "…"
+            if num is not None:
+                model_label = f"#{num} {model_label}"
             ctx.set_source_rgba(1, 1, 1, 0.85)
             ctx.select_font_face("Sans", cairo.FONT_SLANT_NORMAL,
                                  cairo.FONT_WEIGHT_BOLD)
