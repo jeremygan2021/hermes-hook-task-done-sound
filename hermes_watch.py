@@ -623,6 +623,13 @@ def run(stop_event: threading.Event) -> None:
                     if st.last_hook_ts > 0:
                         # Hook-driven hermes: sentinel = alive, hook = activity.
                         # Quiet for QUIET_SECS → awaiting input → DONE (green).
+                        if st.last_state == "success":
+                            # Already announced done. Do NOT pull back to busy —
+                            # that caused an infinite done→busy→done loop with
+                            # repeated TTS. Only a NEW hook event (which updates
+                            # last_hook_ts in the hstate=="busy" branch above)
+                            # restarts the work cycle.
+                            continue
                         if st.last_state != "busy":
                             _log(f"  ▲ pid {pid} ({st.pty}) sentinel+hook says BUSY")
                             if st.last_state == "idle":
@@ -677,8 +684,10 @@ def run(stop_event: threading.Event) -> None:
                 #    events for QUIET_SECS) but the process is alive → the
                 #    current turn finished and the agent waits for input = DONE.
                 #    This is what turns the light GREEN — not "call finished".
-                #    Based on last_hook_ts (independent of CPU fallback timers).
-                if hstate is None and st.last_state in ("busy", "needs_perm"):
+                #    Only for hook-driven sessions (last_hook_ts > 0); pure
+                #    CPU/IO processes (opencode etc.) use the idle transition
+                #    above and must NOT double-fire.
+                if hstate is None and st.last_hook_ts > 0 and st.last_state in ("busy", "needs_perm"):
                     quiet_for = now - max(st.last_hook_ts, st.since)
                     if quiet_for >= QUIET_SECS:
                         _log(f"  ✓ pid {pid} ({st.pty}) quiet {quiet_for:.0f}s → DONE (awaiting input)")
