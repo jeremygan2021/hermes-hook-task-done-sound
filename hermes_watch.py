@@ -53,7 +53,10 @@ STATUS_DIR = Path("/tmp")
 
 # Tunables (overridable via CLI flags)
 IDLE_THRESHOLD = 2.0     # group CPU% below this counts as idle (legacy fallback)
-BUSY_THRESHOLD = 8.0     # group CPU% above this counts as busy (legacy fallback)
+BUSY_THRESHOLD = 40.0    # CPU% for real work (tool runs, compiles); TUI
+                         # animations (opencode spinner) sit at 5-25% and must
+                         # NOT count as busy. TCP connection is the primary
+                         # signal; this high CPU bar is a secondary fallback.
 IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue (legacy)
 BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue (legacy)
 QUIET_SECS = 4.0         # hook-driven session quiet this long → DONE (green)
@@ -477,17 +480,16 @@ def detect_agent(pid: int, comm: str) -> str:
         return "claude"
     if c in ("opencode", "opencode-cli"):
         return "opencode"
-    # node / bun shims: peek at argv0
+    # node / bun shims: argv0 must be the agent binary itself
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             args = f.read().decode("utf-8", "replace").split("\0")
     except OSError:
         return ""
     argv0 = args[0].split("/")[-1].lower() if args else ""
-    joined = " ".join(args).lower()
-    if "claude" in argv0 or "/claude" in joined:
+    if argv0 in ("claude", "claude-code", "claude-code-cli"):
         return "claude"
-    if "opencode" in argv0 or "opencode" in joined:
+    if argv0 in ("opencode", "opencode-cli", "opencode-tui"):
         return "opencode"
     return ""
 
@@ -520,9 +522,10 @@ def _tts_report_for(agent: str, event: str) -> str | None:
 def _sample_io_bytes(pid: int) -> int:
     """Cumulative bytes read by pid (rchar from /proc/<pid>/io).
 
-    A hermes process waiting on the LLM stream shows ~0 CPU but its socket
-    read counter climbs every time a chunk arrives — this is the signal that
-    distinguishes "working" from "idle at the prompt".
+    NOTE: rchar includes terminal reads, so TUI-driven agents (opencode's
+    spinner, hermes' prompt) show continuous rchar growth even when idle.
+    Use this only as a weak fallback — the TCP-connection check is the
+    reliable "calling an LLM API" signal.
     """
     try:
         with open(f"/proc/{pid}/io") as f:
@@ -532,6 +535,54 @@ def _sample_io_bytes(pid: int) -> int:
     except (OSError, ValueError, IndexError):
         pass
     return 0
+
+
+def _socket_inodes(pid: int) -> set[str]:
+    """Inode numbers of all sockets opened by a process."""
+    inodes: set[str] = set()
+    try:
+        fd_dir = f"/proc/{pid}/fd"
+        for name in os.listdir(fd_dir):
+            try:
+                link = os.readlink(f"{fd_dir}/{name}")
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                inodes.add(link[len("socket:["):-1])
+    except OSError:
+        pass
+    return inodes
+
+
+def _has_live_tcp(pid: int) -> bool:
+    """True if the process has an ESTABLISHED TCP connection.
+
+    Agents calling an LLM API hold an ESTABLISHED connection while streaming.
+    Local TUI animation / prompt rendering opens no TCP, so this cleanly
+    separates "working" from "idle at the prompt" without rchar noise.
+    """
+    inodes = _socket_inodes(pid)
+    if not inodes:
+        return False
+    try:
+        for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+            with open(table) as f:
+                next(f, None)  # header
+                for line in f:
+                    parts = line.split()
+                    # 0:sl 1:local 2:rem 3:st 4:tx 5:rx ... 9:inode
+                    if len(parts) >= 10 and parts[3] == "01" and parts[9] in inodes:
+                        return True
+    except OSError:
+        pass
+    return False
+
+
+def _group_has_live_tcp(state: ProcState) -> bool:
+    """TCP check across the process group (parent + children)."""
+    if _has_live_tcp(state.pid):
+        return True
+    return any(_has_live_tcp(c) for c in state.children)
 
 
 def group_io_delta(state: ProcState) -> int:
@@ -586,6 +637,7 @@ def run(stop_event: threading.Event) -> None:
                     tracked[pid] = st
                     st.last_state = "unknown"   # don't fire on first sight
                     st.since = time.time()
+                    st.last_activity_ts = time.time()   # seed: avoid now-0 blowup
                     _log(f"  + watching pid {pid} ({st.pty})")
             # evaluate each
             now = time.time()
@@ -651,34 +703,51 @@ def run(stop_event: threading.Event) -> None:
                 # 4) CPU/IO fallback (no hook file, no sentinel — legacy launch)
                 cpu = group_cpu(st)
                 io_delta = group_io_delta(st)
-                active = (cpu >= BUSY_THRESHOLD or io_delta > 0)
-                if active:
+                tcp = _group_has_live_tcp(st)
+                # PRIMARY: an ESTABLISHED TCP connection = calling an API
+                # (LLM stream). TUI animation has no TCP, so idle-at-prompt
+                # agents (opencode spinner at 15-25% CPU) stay idle.
+                # SECONDARY: sustained high CPU (tool exec, compile, tests).
+                if tcp or cpu >= BUSY_THRESHOLD:
                     st.last_activity_ts = now
-                # A process is "busy" if it has shown ANY activity recently
-                # (bursty node/opencode pattern: short CPU bursts + long waits).
-                # It only becomes "idle" after QUIET_SECS of total silence.
-                observed = "busy" if (now - st.last_activity_ts) < QUIET_SECS else "idle"
+                    observed = "busy"
+                else:
+                    # No TCP + no heavy CPU → idle at the prompt. Immediate.
+                    observed = "idle"
                 if debug:
-                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B active={active} quiet={now - st.last_activity_ts:.1f}s state={st.last_state} (fallback)")
+                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B tcp={tcp} active={tcp or cpu >= BUSY_THRESHOLD} state={st.last_state} → {observed} (fallback)")
                 # transitions
                 if st.last_state == "unknown":
+                    # First observation. If the process is already active
+                    # (TCP/CPU), announce busy so the GUI doesn't stay idle.
+                    was_unknown = True
                     st.last_state = observed
                     st.since = now
+                    if observed == "busy":
+                        _log(f"  ▲ pid {pid} ({st.pty}) first sight BUSY")
+                        _alert("start", st.pty, pid)
+                        st.last_alert_at = now
                     continue
                 if observed == st.last_state:
                     continue
                 if st.last_state == "busy" and observed == "idle":
-                    # Truly quiet for QUIET_SECS — the turn finished.
+                    # Truly quiet — the turn finished.
                     if now - st.last_alert_at >= 3.0:
                         _alert("done", st.pty, pid)
                         st.last_alert_at = now
                     st.last_state = "idle"
                     st.since = now
-                elif st.last_state == "idle" and observed == "busy":
+                elif st.last_state in ("idle", "success") and observed == "busy":
+                    # New activity (TCP/CPU) — back to work. From success this
+                    # is a NEW turn (user sent a message); from idle a resume.
                     if now - st.last_alert_at >= 3.0:
                         _alert("start", st.pty, pid)
                         st.last_alert_at = now
                     st.last_state = "busy"
+                    st.since = now
+                elif st.last_state == "success" and observed == "idle":
+                    # Green already shown; just settle to idle silently.
+                    st.last_state = "idle"
                     st.since = now
                 # 5) QUIET-SETTLE: hook-driven session went quiet (no busy/perm
                 #    events for QUIET_SECS) but the process is alive → the

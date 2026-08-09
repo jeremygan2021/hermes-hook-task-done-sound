@@ -42,6 +42,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib  # noqa: E402
@@ -292,26 +293,26 @@ def add_or_update(key: str, label: str, agent: str = "hermes", pid: int = 0) -> 
         # A recent socket push (success/failure/needs_perm) wins for 12s so
         # the green light stays visible, then autofade handles the rest.
         hstate = _hook_state(pid) if pid else None
+        recent_push = time.time() - _last_busy_push.get(key, 0) <= 12.0
         if hstate == "needs_perm":
             s.state = "needs_perm"
             s.success_since = 0.0
         elif hstate == "busy":
-            if time.time() - _last_busy_push.get(key, 0) > 12.0:
+            if not recent_push:
                 if s.state != "busy":
                     s.state = "busy"
                     s.success_since = 0.0
         elif s.state == "needs_perm":
             # Hook file gone (approval answered) → back to busy.
-            if time.time() - _last_busy_push.get(key, 0) > 12.0:
+            if not recent_push:
                 s.state = "busy"
                 s.success_since = 0.0
-        elif pid and _sentinel_busy(pid):
-            # Process alive but no fresh hook activity → likely awaiting input.
+        elif recent_push:
+            # Watch just told us the state (busy/success/needs_perm) — respect it.
             pass
         elif s.state == "busy":
-            # Sentinel gone AND no fresh socket push → fall back to idle.
-            if time.time() - _last_busy_push.get(key, 0) > 2.0:
-                s.state = "idle"
+            # No fresh push, no hook, no sentinel → fall back to idle.
+            s.state = "idle"
 
 
 def set_state(key: str, state: str) -> bool:
@@ -459,7 +460,12 @@ def model_for_pid(pid: int) -> str | None:
 
 # ──── agent discovery ────────────────────────────────────────────
 def detect_agent(pid: int, comm: str) -> str:
-    """Map a process to an agent type.  Checks comm first, then argv0."""
+    """Map a process to an agent type.  Checks comm first, then argv0.
+
+    Python/node wrapper processes only count as an agent if their argv0 is
+    literally the agent binary — a python3 process whose cmdline merely
+    mentions "opencode" (e.g. our own test scripts) is NOT an agent.
+    """
     c = comm.lower()
     if c == "hermes":
         return "hermes"
@@ -467,17 +473,16 @@ def detect_agent(pid: int, comm: str) -> str:
         return "claude"
     if c in ("opencode", "opencode-cli"):
         return "opencode"
-    # node / bun shims: peek at argv0
+    # node / bun shims: argv0 must be the agent binary itself
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             args = f.read().decode("utf-8", "replace").split("\0")
     except OSError:
         return ""
     argv0 = args[0].split("/")[-1].lower() if args else ""
-    joined = " ".join(args).lower()
-    if "claude" in argv0 or "/claude" in joined:
+    if argv0 in ("claude", "claude-code", "claude-code-cli"):
         return "claude"
-    if "opencode" in argv0 or "opencode" in joined:
+    if argv0 in ("opencode", "opencode-cli", "opencode-tui"):
         return "opencode"
     return ""
 
