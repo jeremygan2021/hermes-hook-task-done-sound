@@ -253,7 +253,7 @@ _HOOK_STALE_SECS = 60.0
 def _hook_state(pid: int) -> str | None:
     """Read Hermes' official lifecycle hook state for a pid.
 
-    Returns "busy", "needs_perm", or None if no fresh state file.
+    Returns "busy", "needs_perm", "done", or None if no fresh state file.
     """
     try:
         p = f"/tmp/hermes-hook-{pid}.state"
@@ -297,6 +297,11 @@ def add_or_update(key: str, label: str, agent: str = "hermes", pid: int = 0) -> 
         if hstate == "needs_perm":
             s.state = "needs_perm"
             s.success_since = 0.0
+        elif hstate == "done":
+            # Hermes' FINAL answer — whole task done → green light.
+            if s.state != "success":
+                s.state = "success"
+                s.success_since = time.time()
         elif hstate == "busy":
             if not recent_push:
                 if s.state != "busy":

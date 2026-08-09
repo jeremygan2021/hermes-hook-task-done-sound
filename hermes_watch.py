@@ -59,7 +59,11 @@ BUSY_THRESHOLD = 40.0    # CPU% for real work (tool runs, compiles); TUI
                          # signal; this high CPU bar is a secondary fallback.
 IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue (legacy)
 BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue (legacy)
-QUIET_SECS = 4.0         # hook-driven session quiet this long → DONE (green)
+QUIET_SECS = 30.0        # FALLBACK ONLY: hook file lost + this long quiet →
+                         # assume done. Primary completion signal is the hook
+                         # "done" state (final answer, no tool calls). 30s is
+                         # long enough that multi-step turn gaps never falsely
+                         # complete, short enough to recover if hooks break.
 POLL_INTERVAL = 0.25     # sampling cadence
 SAMPLE_WINDOW = 1.0      # ps sample window in seconds (cumulative)
 VOLUME = 0.6
@@ -418,16 +422,17 @@ HOOK_STALE_SECS = 60.0   # hook state file older than this is ignored
 def _hook_state(pid: int) -> str | None:
     """Read Hermes' official lifecycle hook state for a pid.
 
-    Returns "busy", "needs_perm", "idle", or None if no fresh hook state.
+    Returns "busy", "needs_perm", "done", or None if no fresh hook state.
 
     Hermes writes /tmp/hermes-hook-<pid>.state via the shell-hooks mechanism
     (config.yaml hooks: section → hermes-hook-status script). This is the
     AUTHORITATIVE signal — the agent itself says what it's doing:
-      - busy       → pre/post llm_call, pre/post tool_call, subagent events
+      - busy       → pre/post llm_call, pre/post tool_call, subagent events,
+                     or a post_api_request that requested tool calls
       - needs_perm → pre_approval_request (awaiting user approval)
-    We never see "success" here: the agent doesn't emit a "finished" event;
-    it just goes quiet while waiting for the user's next input. The watcher
-    maps quiet-but-alive to "success" (green) after a settle timeout.
+      - done       → post_api_request with NO tool_calls and finish_reason
+                     "stop" — the FINAL answer. The whole task is complete,
+                     not just one step. This is the only true "finished".
     """
     try:
         p = STATUS_DIR / f"hermes-hook-{pid}.state"
@@ -655,6 +660,17 @@ def run(stop_event: threading.Event) -> None:
                         st.last_state = "needs_perm"
                         st.since = now
                     continue
+                if hstate == "done":
+                    # FINAL answer from Hermes — whole task complete.
+                    # Push success immediately (authoritative, no guessing).
+                    if st.last_state != "success":
+                        _log(f"  ✓ pid {pid} ({st.pty}) hook says DONE (final answer)")
+                        _alert("done", st.pty, pid)
+                        st.last_alert_at = now
+                        st.last_state = "success"
+                        st.since = now
+                        st.last_hook_ts = now
+                    continue
                 if st.last_state == "needs_perm":
                     # Approval answered (hook file gone / busy again) — back to work
                     _log(f"  ↻ pid {pid} ({st.pty}) approval resolved → busy")
@@ -664,7 +680,8 @@ def run(stop_event: threading.Event) -> None:
                     st.last_hook_ts = now
                     if st.last_state != "busy":
                         _log(f"  ▲ pid {pid} ({st.pty}) hook says BUSY")
-                        if st.last_state == "idle" or st.last_state == "unknown":
+                        if st.last_state in ("idle", "unknown", "success", "needs_perm"):
+                            # Any non-busy → busy is a real transition: announce.
                             _alert("start", st.pty, pid)
                             st.last_alert_at = now
                         st.last_state = "busy"

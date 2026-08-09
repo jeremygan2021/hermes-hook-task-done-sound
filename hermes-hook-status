@@ -5,7 +5,7 @@ hermes-hook-status — official Hermes lifecycle hook → status file bridge.
 Reads the hook event JSON from stdin (Hermes shell-hooks mechanism) and
 writes a tiny status file that hermes-watch / hermes-light consume:
 
-    /tmp/hermes-hook-<PPID>.state     "busy|needs_perm|idle|<ts>"
+    /tmp/hermes-hook-<PPID>.state     "busy|needs_perm|done|<ts>"
 
 The hook subprocess's PPID is the hermes CLI process itself, so we key the
 status file by PPID — exactly the pid the watcher tracks.
@@ -14,8 +14,15 @@ Event → status mapping (authoritative, from Hermes itself):
     pre_llm_call / pre_api_request / pre_tool_call / subagent_start
         → busy          (agent actively working)
     post_llm_call / post_api_request / post_tool_call / subagent_stop
-        → busy          (still working; brief gaps between calls stay BLUE,
-                         NOT green — a gap is not "done")
+        → busy          (still working — a response that requested tool calls
+                         means the turn continues)
+    post_api_request with assistant_tool_call_count == 0 AND
+    finish_reason == "stop"
+        → done          (FINAL answer: the agent produced a response that
+                         needs no more tool calls — the whole task finished.
+                         This is the ONLY "task complete" signal. Multi-step
+                         turns (LLM→tool→LLM→tool→…→final) never falsely
+                         report done in the gaps between steps.)
     pre_approval_request
         → needs_perm    (red blinking light — awaiting user approval)
     post_approval_response
@@ -31,26 +38,45 @@ from pathlib import Path
 
 BUSY_EVENTS = {
     "pre_llm_call", "pre_api_request", "pre_tool_call", "subagent_start",
-    "post_llm_call", "post_api_request", "post_tool_call", "subagent_stop",
+    "post_llm_call", "post_tool_call", "subagent_stop",
     "post_approval_response",
 }
+# post_api_request is special: busy unless it's the FINAL answer (see below).
 PERM_EVENTS = {"pre_approval_request"}
 END_EVENTS = {"on_session_end", "on_session_finalize"}
+DONE_EVENTS = {"post_api_request"}   # only when it's a final answer
 
 STATUS_DIR = Path("/tmp")
 
 
+def _is_final_answer(payload: dict) -> bool:
+    """True if this post_api_request needs no further tool calls.
+
+    Hermes tells us via assistant_tool_call_count (0 = no tools requested)
+    and finish_reason (stop = model finished; tool_calls = keep going).
+    Both must hold for the whole task to be complete.
+    """
+    tool_count = payload.get("assistant_tool_call_count", 0)
+    try:
+        tool_count = int(tool_count)
+    except (TypeError, ValueError):
+        tool_count = 0
+    finish = str(payload.get("finish_reason", "") or "").lower()
+    # Also check nested assistant_message if the count key is absent
+    if "assistant_tool_call_count" not in payload:
+        am = payload.get("assistant_message") or {}
+        if isinstance(am, dict):
+            tool_count = len(am.get("tool_calls") or [])
+    return tool_count == 0 and finish in ("stop", "end_turn", "eos")
+
+
 def main() -> None:
-    # Hermes passes the event payload as JSON on stdin.
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
         payload = {}
 
     event = payload.get("hook_event_name") or payload.get("event") or ""
-    session_id = payload.get("session_id") or ""
-
-    # The subprocess's parent is the hermes CLI process.
     hermes_pid = os.getppid()
     state_file = STATUS_DIR / f"hermes-hook-{hermes_pid}.state"
 
@@ -63,10 +89,11 @@ def main() -> None:
 
     if event in PERM_EVENTS:
         state = "needs_perm"
-    elif event in BUSY_EVENTS:
+    elif event in DONE_EVENTS and _is_final_answer(payload):
+        state = "done"
+    elif event in BUSY_EVENTS or event in DONE_EVENTS:
         state = "busy"
     else:
-        # Unknown / no event — don't clobber anything.
         return
 
     try:
