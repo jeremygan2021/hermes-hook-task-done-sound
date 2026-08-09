@@ -246,6 +246,30 @@ def _sentinel_busy(pid: int) -> bool:
     return os.path.exists(f"/tmp/hermes-status-{pid}")
 
 
+_HOOK_STALE_SECS = 60.0
+
+
+def _hook_state(pid: int) -> str | None:
+    """Read Hermes' official lifecycle hook state for a pid.
+
+    Returns "busy", "needs_perm", or None if no fresh state file.
+    """
+    try:
+        p = f"/tmp/hermes-hook-{pid}.state"
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            parts = f.read().strip().split()
+        if len(parts) < 2:
+            return None
+        state, ts = parts[0], float(parts[1])
+        if time.time() - ts > _HOOK_STALE_SECS:
+            return None
+        return state
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def add_or_update(key: str, label: str, agent: str = "hermes", pid: int = 0) -> None:
     with sessions_lock:
         s = sessions.get(key)
@@ -263,14 +287,27 @@ def add_or_update(key: str, label: str, agent: str = "hermes", pid: int = 0) -> 
         if pid:
             s.model = model_for_pid(pid) or s.model
             s.start_ts = _proc_start_epoch(pid) or s.start_ts
-        # Sentinel check: /tmp/hermes-status-<pid> exists → agent process alive.
-        # BUT a recent socket push (success/failure/needs_perm) wins — the
-        # agent process can stay alive while the current task finished.
-        if pid and _sentinel_busy(pid):
+        # Official hook state check: /tmp/hermes-hook-<pid>.state is the
+        # AUTHORITATIVE signal (written by Hermes itself via shell hooks).
+        # A recent socket push (success/failure/needs_perm) wins for 12s so
+        # the green light stays visible, then autofade handles the rest.
+        hstate = _hook_state(pid) if pid else None
+        if hstate == "needs_perm":
+            s.state = "needs_perm"
+            s.success_since = 0.0
+        elif hstate == "busy":
             if time.time() - _last_busy_push.get(key, 0) > 12.0:
                 if s.state != "busy":
                     s.state = "busy"
                     s.success_since = 0.0
+        elif s.state == "needs_perm":
+            # Hook file gone (approval answered) → back to busy.
+            if time.time() - _last_busy_push.get(key, 0) > 12.0:
+                s.state = "busy"
+                s.success_since = 0.0
+        elif pid and _sentinel_busy(pid):
+            # Process alive but no fresh hook activity → likely awaiting input.
+            pass
         elif s.state == "busy":
             # Sentinel gone AND no fresh socket push → fall back to idle.
             if time.time() - _last_busy_push.get(key, 0) > 2.0:
@@ -635,7 +672,8 @@ class LightPanel(Gtk.DrawingArea):
                 layout = [("dim", 0), ("dim", 1), ("dim", 2)]
                 layout[cur] = ("blue", cur)
             elif s.state == "needs_perm":
-                layout = [("dim", 0), ("yellow", 1), ("dim", 2)]
+                # RED BLINKING — awaiting user approval
+                layout = [("red", 0), ("dim", 1), ("dim", 2)]
             elif s.state == "success":
                 layout = [("dim", 0), ("dim", 1), ("green", 2)]
             elif s.state == "failure":
@@ -649,7 +687,7 @@ class LightPanel(Gtk.DrawingArea):
                 alpha = 1.0
                 if color == "dim":
                     alpha = 0.40
-                elif s.state == "failure" and color == "red":
+                elif s.state in ("failure", "needs_perm") and color == "red":
                     alpha = blink
                 _light(ctx, lx, LIGHTS_Y, rgb, alpha, LIGHT_R)
 
@@ -671,14 +709,14 @@ class LightPanel(Gtk.DrawingArea):
             # 4d. Bottom line: state text (left) + uptime (right)
             state_text = {
                 "busy":       "running",
-                "needs_perm": "waiting",
+                "needs_perm": "授权",
                 "success":    "done",
                 "failure":    "failed",
                 "idle":       "idle",
             }.get(s.state, "idle")
             state_color = {
                 "busy":       (0.55, 0.85, 1.00),
-                "needs_perm": (1.00, 0.82, 0.18),
+                "needs_perm": (1.00, 0.34, 0.36),
                 "success":    (0.34, 0.85, 0.46),
                 "failure":    (1.00, 0.34, 0.36),
                 "idle":       (0.55, 0.55, 0.65),

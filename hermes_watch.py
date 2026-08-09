@@ -52,10 +52,11 @@ LOGFILE = Path.home() / ".hermes" / "logs" / "hermes-watch.log"
 STATUS_DIR = Path("/tmp")
 
 # Tunables (overridable via CLI flags)
-IDLE_THRESHOLD = 2.0     # group CPU% below this counts as idle
-BUSY_THRESHOLD = 8.0     # group CPU% above this counts as busy (hermes thinking often 5-15%)
-IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue
-BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue
+IDLE_THRESHOLD = 2.0     # group CPU% below this counts as idle (legacy fallback)
+BUSY_THRESHOLD = 8.0     # group CPU% above this counts as busy (legacy fallback)
+IDLE_SECS = 3.0          # must stay idle this long → fire "done" cue (legacy)
+BUSY_SECS = 1.0          # must stay busy this long → fire "start" cue (legacy)
+QUIET_SECS = 4.0         # hook-driven session quiet this long → DONE (green)
 POLL_INTERVAL = 0.25     # sampling cadence
 SAMPLE_WINDOW = 1.0      # ps sample window in seconds (cumulative)
 VOLUME = 0.6
@@ -73,6 +74,9 @@ class ProcState:
     children_cpu: float = 0.0
     io_prev: int = 0                     # last total rchar bytes (IO activity)
     last_alert_at: float = 0.0           # for rate-limiting audio per process
+    last_hook_ts: float = 0.0            # last time an official hook event fired
+    last_activity_ts: float = 0.0        # last time CPU/IO showed activity (fallback)
+    agent: str = "hermes"                # hermes | claude | opencode
 
 
 # ──────────────────────────── audio ────────────────────────────
@@ -233,7 +237,8 @@ def discover_hermes_pids(self_pid: int) -> dict[int, ProcState]:
         if len(parts) < 3:
             continue
         pid, comm, tty = parts
-        if comm != "hermes":
+        agent = detect_agent(int(pid), comm) if pid.isdigit() else ""
+        if not agent:
             continue
         try:
             pid_i = int(pid)
@@ -242,7 +247,9 @@ def discover_hermes_pids(self_pid: int) -> dict[int, ProcState]:
         if pid_i == self_pid or pid_i == os.getpid():
             continue
         pty = tty if tty != "?" else "(no-tty)"
-        pids[pid_i] = ProcState(pid=pid_i, pty=pty)
+        st = ProcState(pid=pid_i, pty=pty)
+        st.agent = agent
+        pids[pid_i] = st
     return pids
 
 
@@ -402,6 +409,39 @@ def _sentinel_busy(pid: int) -> bool:
     return (STATUS_DIR / f"hermes-status-{pid}").exists()
 
 
+HOOK_STALE_SECS = 60.0   # hook state file older than this is ignored
+
+
+def _hook_state(pid: int) -> str | None:
+    """Read Hermes' official lifecycle hook state for a pid.
+
+    Returns "busy", "needs_perm", "idle", or None if no fresh hook state.
+
+    Hermes writes /tmp/hermes-hook-<pid>.state via the shell-hooks mechanism
+    (config.yaml hooks: section → hermes-hook-status script). This is the
+    AUTHORITATIVE signal — the agent itself says what it's doing:
+      - busy       → pre/post llm_call, pre/post tool_call, subagent events
+      - needs_perm → pre_approval_request (awaiting user approval)
+    We never see "success" here: the agent doesn't emit a "finished" event;
+    it just goes quiet while waiting for the user's next input. The watcher
+    maps quiet-but-alive to "success" (green) after a settle timeout.
+    """
+    try:
+        p = STATUS_DIR / f"hermes-hook-{pid}.state"
+        if not p.is_file():
+            return None
+        content = p.read_text().strip()
+        parts = content.split()
+        if len(parts) < 2:
+            return None
+        state, ts = parts[0], float(parts[1])
+        if time.time() - ts > HOOK_STALE_SECS:
+            return None
+        return state
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 # ──────────────────────── shared settings ──────────────────────
 SETTINGS_PATH = Path.home() / ".hermes" / "hermes-light-settings.json"
 TTS_WAV_DIR = Path.home() / ".local" / "share" / "hermes-light" / "tts" / "wav"
@@ -425,7 +465,11 @@ def _load_settings() -> dict:
 
 
 def detect_agent(pid: int, comm: str) -> str:
-    """Map a process to an agent type (hermes/claude/opencode)."""
+    """Map a process to an agent type (hermes/claude/opencode).
+
+    Only returns a known agent — everything else gets "" so the watcher
+    does NOT track random system processes.
+    """
     c = comm.lower()
     if c == "hermes":
         return "hermes"
@@ -433,18 +477,19 @@ def detect_agent(pid: int, comm: str) -> str:
         return "claude"
     if c in ("opencode", "opencode-cli"):
         return "opencode"
+    # node / bun shims: peek at argv0
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             args = f.read().decode("utf-8", "replace").split("\0")
     except OSError:
-        return "hermes"
+        return ""
     argv0 = args[0].split("/")[-1].lower() if args else ""
     joined = " ".join(args).lower()
     if "claude" in argv0 or "/claude" in joined:
         return "claude"
     if "opencode" in argv0 or "opencode" in joined:
         return "opencode"
-    return "hermes"
+    return ""
 
 
 # TTS report wav keyed by agent/event
@@ -490,8 +535,15 @@ def _sample_io_bytes(pid: int) -> int:
 
 
 def group_io_delta(state: ProcState) -> int:
-    """Bytes read since last sample across parent + children."""
+    """Bytes read since last sample across parent + children.
+
+    First sample only seeds the baseline (returns 0) so a freshly-tracked
+    process doesn't look like a burst of activity from cumulative rchar.
+    """
     total = _sample_io_bytes(state.pid) + sum(_sample_io_bytes(c) for c in state.children)
+    if state.io_prev == 0:
+        state.io_prev = total
+        return 0
     delta = max(0, total - state.io_prev)
     state.io_prev = total
     return delta
@@ -539,54 +591,101 @@ def run(stop_event: threading.Event) -> None:
             now = time.time()
             debug = os.getenv("HERMES_WATCH_DEBUG")
             for pid, st in tracked.items():
-                # 2) Sentinel-based busy (highest priority — instant & 100% accurate)
-                if _sentinel_busy(pid):
+                # 2) OFFICIAL hook state (highest priority — Hermes itself says)
+                hstate = _hook_state(pid)
+                if hstate == "needs_perm":
+                    st.last_hook_ts = now
+                    if st.last_state != "needs_perm":
+                        _log(f"  ⚠ pid {pid} ({st.pty}) AWAITING APPROVAL")
+                        if st.last_state != "busy" or now - st.last_alert_at >= 3.0:
+                            _alert("needs_perm", st.pty, pid)
+                            st.last_alert_at = now
+                        st.last_state = "needs_perm"
+                        st.since = now
+                    continue
+                if st.last_state == "needs_perm":
+                    # Approval answered (hook file gone / busy again) — back to work
+                    _log(f"  ↻ pid {pid} ({st.pty}) approval resolved → busy")
+                    st.last_state = "busy"
+                    st.since = now
+                if hstate == "busy":
+                    st.last_hook_ts = now
                     if st.last_state != "busy":
-                        _log(f"  ▲ pid {pid} ({st.pty}) sentinel says BUSY")
-                        if st.last_state == "idle":
+                        _log(f"  ▲ pid {pid} ({st.pty}) hook says BUSY")
+                        if st.last_state == "idle" or st.last_state == "unknown":
                             _alert("start", st.pty, pid)
                             st.last_alert_at = now
                         st.last_state = "busy"
                         st.since = now
                     continue
-                # 3) CPU + IO fallback (no sentinel — wrapper not used for this PID)
+                # 3) Sentinel busy (wrapper fallback — process alive)
+                if _sentinel_busy(pid):
+                    if st.last_hook_ts > 0:
+                        # Hook-driven hermes: sentinel = alive, hook = activity.
+                        # Quiet for QUIET_SECS → awaiting input → DONE (green).
+                        if st.last_state != "busy":
+                            _log(f"  ▲ pid {pid} ({st.pty}) sentinel+hook says BUSY")
+                            if st.last_state == "idle":
+                                _alert("start", st.pty, pid)
+                                st.last_alert_at = now
+                            st.last_state = "busy"
+                            st.since = now
+                        if st.last_state == "busy" and now - st.last_hook_ts >= QUIET_SECS:
+                            _log(f"  ✓ pid {pid} ({st.pty}) quiet → DONE (awaiting input)")
+                            _alert("done", st.pty, pid)
+                            st.last_state = "success"
+                            st.since = now
+                            st.last_hook_ts = now
+                        continue
+                    # No hook history (legacy launch / opencode / claude):
+                    # sentinel just means the process is alive — fall through to
+                    # CPU/IO sampling to decide busy vs idle. Do NOT quiet-settle.
+                    pass
+                # 4) CPU/IO fallback (no hook file, no sentinel — legacy launch)
                 cpu = group_cpu(st)
                 io_delta = group_io_delta(st)
-                if cpu >= BUSY_THRESHOLD or io_delta > 0:
-                    observed = "busy"
-                elif cpu <= IDLE_THRESHOLD and io_delta == 0:
-                    observed = "idle"
-                else:
-                    observed = "mid"
+                active = (cpu >= BUSY_THRESHOLD or io_delta > 0)
+                if active:
+                    st.last_activity_ts = now
+                # A process is "busy" if it has shown ANY activity recently
+                # (bursty node/opencode pattern: short CPU bursts + long waits).
+                # It only becomes "idle" after QUIET_SECS of total silence.
+                observed = "busy" if (now - st.last_activity_ts) < QUIET_SECS else "idle"
                 if debug:
-                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B observed={observed} state={st.last_state} (fallback)")
+                    _log(f"  ? pid {pid} cpu={cpu:6.2f}% io={io_delta}B active={active} quiet={now - st.last_activity_ts:.1f}s state={st.last_state} (fallback)")
                 # transitions
                 if st.last_state == "unknown":
-                    if observed in ("idle", "busy"):
-                        st.last_state = observed
-                        st.since = now
+                    st.last_state = observed
+                    st.since = now
                     continue
                 if observed == st.last_state:
                     continue
-                # mid = transitional, don't react yet
-                if observed == "mid":
-                    continue
-                dur = now - st.since
-                if st.last_state == "busy" and observed == "idle" and dur >= IDLE_SECS:
+                if st.last_state == "busy" and observed == "idle":
+                    # Truly quiet for QUIET_SECS — the turn finished.
                     if now - st.last_alert_at >= 3.0:
                         _alert("done", st.pty, pid)
                         st.last_alert_at = now
                     st.last_state = "idle"
                     st.since = now
-                elif st.last_state == "idle" and observed == "busy" and dur >= BUSY_SECS:
+                elif st.last_state == "idle" and observed == "busy":
                     if now - st.last_alert_at >= 3.0:
                         _alert("start", st.pty, pid)
                         st.last_alert_at = now
                     st.last_state = "busy"
                     st.since = now
-                else:
-                    # not enough dwell time — just update anchor without firing
-                    st.since = now
+                # 5) QUIET-SETTLE: hook-driven session went quiet (no busy/perm
+                #    events for QUIET_SECS) but the process is alive → the
+                #    current turn finished and the agent waits for input = DONE.
+                #    This is what turns the light GREEN — not "call finished".
+                #    Based on last_hook_ts (independent of CPU fallback timers).
+                if hstate is None and st.last_state in ("busy", "needs_perm"):
+                    quiet_for = now - max(st.last_hook_ts, st.since)
+                    if quiet_for >= QUIET_SECS:
+                        _log(f"  ✓ pid {pid} ({st.pty}) quiet {quiet_for:.0f}s → DONE (awaiting input)")
+                        _alert("done", st.pty, pid)
+                        st.last_state = "success"
+                        st.since = now
+                        st.last_hook_ts = now
             stop_event.wait(POLL_INTERVAL)
         except Exception as e:                # noqa: BLE001
             _log(f"loop error: {e}")

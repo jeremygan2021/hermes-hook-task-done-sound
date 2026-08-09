@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""
+hermes-hook-status — official Hermes lifecycle hook → status file bridge.
+
+Reads the hook event JSON from stdin (Hermes shell-hooks mechanism) and
+writes a tiny status file that hermes-watch / hermes-light consume:
+
+    /tmp/hermes-hook-<PPID>.state     "busy|needs_perm|idle|<ts>"
+
+The hook subprocess's PPID is the hermes CLI process itself, so we key the
+status file by PPID — exactly the pid the watcher tracks.
+
+Event → status mapping (authoritative, from Hermes itself):
+    pre_llm_call / pre_api_request / pre_tool_call / subagent_start
+        → busy          (agent actively working)
+    post_llm_call / post_api_request / post_tool_call / subagent_stop
+        → busy          (still working; brief gaps between calls stay BLUE,
+                         NOT green — a gap is not "done")
+    pre_approval_request
+        → needs_perm    (red blinking light — awaiting user approval)
+    post_approval_response
+        → busy          (back to work after the approval)
+    on_session_end / on_session_finalize
+        → remove file   (session over → watcher drops the column)
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+BUSY_EVENTS = {
+    "pre_llm_call", "pre_api_request", "pre_tool_call", "subagent_start",
+    "post_llm_call", "post_api_request", "post_tool_call", "subagent_stop",
+    "post_approval_response",
+}
+PERM_EVENTS = {"pre_approval_request"}
+END_EVENTS = {"on_session_end", "on_session_finalize"}
+
+STATUS_DIR = Path("/tmp")
+
+
+def main() -> None:
+    # Hermes passes the event payload as JSON on stdin.
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+
+    event = payload.get("hook_event_name") or payload.get("event") or ""
+    session_id = payload.get("session_id") or ""
+
+    # The subprocess's parent is the hermes CLI process.
+    hermes_pid = os.getppid()
+    state_file = STATUS_DIR / f"hermes-hook-{hermes_pid}.state"
+
+    if event in END_EVENTS:
+        try:
+            state_file.unlink()
+        except OSError:
+            pass
+        return
+
+    if event in PERM_EVENTS:
+        state = "needs_perm"
+    elif event in BUSY_EVENTS:
+        state = "busy"
+    else:
+        # Unknown / no event — don't clobber anything.
+        return
+
+    try:
+        state_file.write_text(f"{state} {time.time()}\n")
+    except OSError:
+        pass
+
+
+if __name__ == "__main__":
+    main()
